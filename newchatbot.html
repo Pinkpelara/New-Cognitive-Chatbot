@@ -1125,7 +1125,7 @@
                     </button>
                 </div>
 
-                <div class="status-card" id="adminStatusCard">
+                <div class="status-card">
                     <h4>Admin Diagnostics</h4>
                     <p id="adminContextStrategy">Context strategy: not run yet</p>
                     <p id="adminEvalOutput">Evaluation metrics will appear here after responses.</p>
@@ -1160,7 +1160,7 @@
 
     <script>
     const DB_NAME = 'CognitiveSynthesisDB';
-    const DB_VERSION = 3;
+    const DB_VERSION = 4;
     const STORE_NAME = 'documents';
     const CASE_STORE_NAME = 'case_memory';
     const CONTRADICTION_STORE_NAME = 'contradiction_registry';
@@ -1303,11 +1303,11 @@
     }
 
     async function ensureTokenizerLibrary() {
-        if (window.tiktoken || window.jsTiktoken) return;
+        if (window.jsTiktoken || window.tiktoken) return;
         try {
             await loadOptionalScript('https://cdn.jsdelivr.net/npm/js-tiktoken@1.0.14/dist/index.js');
         } catch (error) {
-            console.warn('Tokenizer library unavailable, falling back to heuristic token estimation.', error);
+            console.warn('Tokenizer library unavailable. Falling back to heuristic token estimate.', error);
         }
     }
 
@@ -1439,17 +1439,6 @@
             });
         }
 
-        async clearCases() {
-            if (!this.hasStore(CASE_STORE_NAME)) return;
-            return new Promise((resolve, reject) => {
-                const tx = this.db.transaction(CASE_STORE_NAME, 'readwrite');
-                const store = tx.objectStore(CASE_STORE_NAME);
-                const request = store.clear();
-                request.onsuccess = () => resolve();
-                request.onerror = () => reject(request.error);
-            });
-        }
-
         async getAllContradictions() {
             if (!this.hasStore(CONTRADICTION_STORE_NAME)) return [];
             return new Promise((resolve, reject) => {
@@ -1548,7 +1537,7 @@
         }
 
         extractExceptionIndex(chunks, filename) {
-            const exceptions = [];
+            const entries = [];
             const seen = new Set();
 
             for (const chunk of (chunks || [])) {
@@ -1557,11 +1546,11 @@
                     const sentence = sentenceRaw.trim();
                     if (sentence.length < 20) continue;
                     if (!this.hasExceptionMarker(sentence)) continue;
-                    const key = `${filename}::${chunk.page || 'N/A'}::${sentence.toLowerCase()}`;
+                    const key = `${filename}:${chunk.page || 'N/A'}:${sentence.toLowerCase()}`;
                     if (seen.has(key)) continue;
                     seen.add(key);
-                    exceptions.push({
-                        id: `${chunk.id}-exception-${exceptions.length}`,
+                    entries.push({
+                        id: `${chunk.id}-exception-${entries.length}`,
                         filename,
                         page: chunk.page || 'N/A',
                         chunkId: chunk.id,
@@ -1569,32 +1558,34 @@
                     });
                 }
             }
-
-            return exceptions;
+            return entries;
         }
 
         buildHeuristicSchema(text, filename = 'Document') {
-            const sentences = this.splitIntoSentences(text || '').slice(0, 180);
+            const sentences = this.splitIntoSentences(text || '').slice(0, 220);
             const rules = [];
             const references = new Set();
             const overrides = [];
 
-            const rulePattern = /\b(must|shall|required|is required|may|permitted|prohibited|must not|may not|cannot|will)\b/i;
-            const referencePattern = /\b(ROSI|ACORN|Registrar|Faculty|Policy|Procedure|Calendar|Guideline|Act|Regulation)\b/gi;
-
+            const referenceRegex = /\b(ROSI|ACORN|Registrar|Faculty|Calendar|Policy|Procedure|Guideline|Act|Regulation|System)\b/gi;
             for (const sentenceRaw of sentences) {
                 const sentence = sentenceRaw.trim();
                 if (!sentence) continue;
 
-                if (rulePattern.test(sentence) || /\bif\b.+\bthen\b/i.test(sentence)) {
-                    const ifThen = sentence.match(/\bif\b(.+?)\bthen\b(.+)/i);
+                if (/\bif\b.+\bthen\b/i.test(sentence)) {
+                    const m = sentence.match(/\bif\b(.+?)\bthen\b(.+)/i);
                     rules.push({
-                        condition: ifThen ? ifThen[1].trim() : 'Condition stated in source sentence',
-                        consequence: ifThen ? ifThen[2].trim() : sentence
+                        condition: m ? m[1].trim() : 'Condition described in source sentence',
+                        consequence: m ? m[2].trim() : sentence
+                    });
+                } else if (/\b(must|shall|required|must not|may not|permitted|prohibited|cannot)\b/i.test(sentence)) {
+                    rules.push({
+                        condition: 'Condition described in source sentence',
+                        consequence: sentence
                     });
                 }
 
-                const refs = sentence.match(referencePattern) || [];
+                const refs = sentence.match(referenceRegex) || [];
                 for (const ref of refs) references.add(ref);
 
                 if (this.hasExceptionMarker(sentence)) {
@@ -1604,9 +1595,9 @@
 
             return {
                 filename,
-                primaryRules: rules.slice(0, 20),
-                references: Array.from(references).slice(0, 20),
-                overrides: overrides.slice(0, 20),
+                primaryRules: rules.slice(0, 22),
+                references: Array.from(references).slice(0, 22),
+                overrides: overrides.slice(0, 22),
                 generatedBy: 'heuristic'
             };
         }
@@ -2049,46 +2040,35 @@
         }
 
         estimateTokenCount(text) {
-            const normalized = String(text || '')
-                .replace(/\s+/g, ' ')
-                .trim();
+            const normalized = String(text || '').replace(/\s+/g, ' ').trim();
             if (!normalized) return 0;
-
             try {
                 if (!this.tokenEncoder && window.tiktoken?.encoding_for_model) {
                     this.tokenEncoder = window.tiktoken.encoding_for_model('gpt-4o');
                 } else if (!this.tokenEncoder && window.jsTiktoken?.encodingForModel) {
                     this.tokenEncoder = window.jsTiktoken.encodingForModel('gpt-4o');
                 }
-
                 if (this.tokenEncoder?.encode) {
                     const encoded = this.tokenEncoder.encode(normalized);
                     if (Array.isArray(encoded) || typeof encoded?.length === 'number') {
                         return Math.max(1, encoded.length);
                     }
                 }
-            } catch (error) {
-                // Fallback to heuristic estimation when tokenizer is unavailable.
+            } catch {
+                // Fallback to heuristic estimate below.
             }
-
-            // Approximate token estimation for GPT-family models.
-            const roughWordTokens = normalized.split(' ').length;
-            const punctuationTokens = (normalized.match(/[.,;:!?()[\]{}]/g) || []).length;
-            const numericTokens = (normalized.match(/\b\d+(?:\.\d+)?\b/g) || []).length;
-            const estimated = Math.round((roughWordTokens * 1.18) + (punctuationTokens * 0.35) + (numericTokens * 0.2));
-            return Math.max(1, estimated);
+            const words = normalized.split(' ').length;
+            const punctuation = (normalized.match(/[.,;:!?()[\]{}]/g) || []).length;
+            return Math.max(1, Math.round((words * 1.2) + (punctuation * 0.35)));
         }
 
         estimateDocumentTokens(doc) {
-            const fullText = String(doc?.fullText || '');
-            if (!fullText) {
-                return this.estimateTokenCount((doc?.chunks || []).map(chunk => chunk.text || '').join('\n'));
-            }
-            return this.estimateTokenCount(fullText);
+            if (doc?.fullText) return this.estimateTokenCount(doc.fullText);
+            const merged = (doc?.chunks || []).map(chunk => chunk.text || '').join('\n');
+            return this.estimateTokenCount(merged);
         }
 
         getCorpusTokenEstimate() {
-            if (this.documents.length === 0) return 0;
             return this.documents.reduce((sum, doc) => sum + this.estimateDocumentTokens(doc), 0);
         }
 
@@ -2109,47 +2089,94 @@
         buildExceptionIndex() {
             this.exceptionIndex = [];
             this.exceptionIndexByFilename.clear();
-
             for (const doc of this.documents) {
-                let exceptions = Array.isArray(doc.exceptionIndex) ? doc.exceptionIndex : [];
-                if (!exceptions.length) {
-                    exceptions = (doc.chunks || [])
-                        .flatMap(chunk => {
-                            const sentences = String(chunk.text || '')
-                                .split(/(?<=[.!?])\s+|\n+/)
-                                .map(item => item.trim())
-                                .filter(Boolean);
-                            return sentences
-                                .filter(sentence => EXCEPTION_MARKERS.some(marker => sentence.toLowerCase().includes(marker)))
-                                .map((sentence, idx) => ({
-                                    id: `${chunk.id || `${doc.filename}-${idx}`}-exception`,
-                                    filename: doc.filename,
-                                    page: chunk.page || 'N/A',
-                                    chunkId: chunk.id,
-                                    text: sentence
-                                }));
-                        })
-                        .slice(0, 120);
-                }
-
+                const exceptions = Array.isArray(doc.exceptionIndex) ? doc.exceptionIndex : [];
                 this.exceptionIndexByFilename.set(doc.filename, exceptions);
                 this.exceptionIndex.push(...exceptions);
             }
         }
 
-        getExceptionClausesForDocuments(filenames = []) {
-            const selected = [];
+        buildExceptionEntriesFromChunks(doc) {
+            const out = [];
             const seen = new Set();
-            for (const filename of filenames) {
-                const exceptions = this.exceptionIndexByFilename.get(filename) || [];
-                for (const entry of exceptions) {
-                    const key = `${entry.filename}:${entry.page}:${entry.text}`;
+            for (const chunk of (doc.chunks || [])) {
+                const sentences = String(chunk.text || '')
+                    .split(/(?<=[.!?])\s+|\n+/)
+                    .map(item => item.trim())
+                    .filter(Boolean);
+                for (const sentence of sentences) {
+                    if (sentence.length < 20) continue;
+                    if (!EXCEPTION_MARKERS.some(marker => sentence.toLowerCase().includes(marker))) continue;
+                    const key = `${doc.filename}:${chunk.page || 'N/A'}:${sentence.toLowerCase()}`;
                     if (seen.has(key)) continue;
                     seen.add(key);
-                    selected.push(entry);
+                    out.push({
+                        id: `${chunk.id || `${doc.filename}-${out.length}`}-exception`,
+                        filename: doc.filename,
+                        page: chunk.page || 'N/A',
+                        chunkId: chunk.id,
+                        text: sentence
+                    });
                 }
             }
-            return selected;
+            return out;
+        }
+
+        buildSchemaFromDocument(doc) {
+            const text = String(doc.fullText || '').slice(0, 52000);
+            const sentences = text
+                .split(/(?<=[.!?])\s+|\n+/)
+                .map(item => item.trim())
+                .filter(Boolean)
+                .slice(0, 220);
+            const primaryRules = [];
+            const references = new Set();
+            const overrides = [];
+            const refRegex = /\b(ROSI|ACORN|Registrar|Faculty|Calendar|Policy|Procedure|Guideline|Act|Regulation|System)\b/gi;
+
+            for (const sentence of sentences) {
+                if (/\bif\b.+\bthen\b/i.test(sentence)) {
+                    const m = sentence.match(/\bif\b(.+?)\bthen\b(.+)/i);
+                    primaryRules.push({
+                        condition: m ? m[1].trim() : 'Condition in source sentence',
+                        consequence: m ? m[2].trim() : sentence
+                    });
+                } else if (/\b(must|shall|required|must not|may not|cannot|prohibited)\b/i.test(sentence)) {
+                    primaryRules.push({
+                        condition: 'Condition in source sentence',
+                        consequence: sentence
+                    });
+                }
+
+                const refs = sentence.match(refRegex) || [];
+                for (const ref of refs) references.add(ref);
+                if (EXCEPTION_MARKERS.some(marker => sentence.toLowerCase().includes(marker))) {
+                    overrides.push(sentence);
+                }
+            }
+
+            return {
+                filename: doc.filename,
+                primaryRules: primaryRules.slice(0, 22),
+                references: Array.from(references).slice(0, 22),
+                overrides: overrides.slice(0, 22),
+                generatedBy: 'heuristic'
+            };
+        }
+
+        getExceptionClausesForDocuments(filenames = []) {
+            const out = [];
+            const seen = new Set();
+            for (const filename of filenames) {
+                const clauses = this.exceptionIndexByFilename.get(filename) || [];
+                for (const clause of clauses) {
+                    const key = `${clause.filename}:${clause.page || 'N/A'}:${clause.text}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    out.push(clause);
+                }
+            }
+            return out;
         }
 
         normalizeEmbeddingText(text, maxChars = 2200) {
@@ -2318,14 +2345,10 @@
                 return {
                     ...doc,
                     memory: doc.memory || this.deriveMemoryFromChunks(doc),
-                    exceptionIndex: doc.exceptionIndex || [],
-                    schema: doc.schema || {
-                        filename: doc.filename,
-                        primaryRules: [],
-                        references: [],
-                        overrides: [],
-                        generatedBy: 'heuristic'
-                    }
+                    exceptionIndex: Array.isArray(doc.exceptionIndex) && doc.exceptionIndex.length
+                        ? doc.exceptionIndex
+                        : this.buildExceptionEntriesFromChunks(doc),
+                    schema: doc.schema || this.buildSchemaFromDocument(doc)
                 };
             });
 
@@ -2336,10 +2359,9 @@
             this.buildTokenStats();
             this.buildConceptIndex();
             this.buildExceptionIndex();
-            this.estimatedCorpusTokens = this.getCorpusTokenEstimate();
-            this.contextStrategy = this.estimatedCorpusTokens <= FULL_CORPUS_TOKEN_LIMIT && this.estimatedCorpusTokens > 0
-                ? 'FULL_CORPUS'
-                : 'HYBRID_RETRIEVAL';
+            const strategy = this.getContextStrategy();
+            this.contextStrategy = strategy.strategy;
+            this.estimatedCorpusTokens = strategy.totalTokens;
         }
 
         deriveMemoryFromChunks(doc) {
@@ -2779,35 +2801,32 @@
         }
 
         buildContradictionTargetedQuery(query, prediction = '') {
-            const base = String(query || '').trim();
-            const expected = String(prediction || '').trim();
-            return `${base}
+            return `${query}
 Expected baseline answer:
-${expected}
+${prediction}
 
-Retrieve clauses that may contradict, limit, override, or narrow the expected answer. Prioritize: unless, except, notwithstanding, provided that, subject to, does not apply, only if, in the case of, by way of exception, override.`;
+Retrieve evidence that may contradict, override, or qualify the expected answer. Prioritize exception language: unless, except, notwithstanding, provided that, subject to, does not apply, only if, in the case of, by way of exception, override.`;
         }
 
         async retrieveContradictionTargeted(query, prediction = '', topK = 10) {
             if (!this.allChunks.length) return [];
             const targetedQuery = this.buildContradictionTargetedQuery(query, prediction);
             const queryTokens = this.tokenize(targetedQuery);
-            const exceptionRegex = /\b(unless|except|notwithstanding|provided that|subject to|does not apply|only if|in the case of|by way of exception|override)\b/i;
+            const markerRegex = /\b(unless|except|notwithstanding|provided that|subject to|does not apply|only if|in the case of|by way of exception|override)\b/i;
 
             const scored = this.allChunks.map(chunk => {
-                const baseScore = this.calculateLocalRelevanceScore(chunk, queryTokens, [], []);
-                const chunkLower = String(chunk.text || '').toLowerCase();
-                const hasException = exceptionRegex.test(chunkLower);
-                const contradictionCue = /\b(however|but|not|except|unless|override|contrary|despite)\b/i.test(chunkLower);
-                let score = baseScore;
-                if (hasException) score += 0.4;
-                if (contradictionCue) score += 0.18;
-                return { ...chunk, score, hasException };
+                const base = this.calculateLocalRelevanceScore(chunk, queryTokens, [], []);
+                const hasMarker = markerRegex.test(chunk.text || '');
+                const cue = /\b(however|but|contrary|despite|except|unless|override)\b/i.test(chunk.text || '');
+                let score = base;
+                if (hasMarker) score += 0.45;
+                if (cue) score += 0.2;
+                return { ...chunk, score, hasMarker };
             }).sort((a, b) => b.score - a.score);
 
-            const hardMatches = scored.filter(item => item.hasException).slice(0, Math.ceil(topK * 0.8));
+            const markerFirst = scored.filter(item => item.hasMarker).slice(0, Math.ceil(topK * 0.75));
             const fallback = scored.slice(0, Math.ceil(topK * 0.6));
-            return this.mergeUniqueChunks(hardMatches, fallback, topK);
+            return this.mergeUniqueChunks(markerFirst, fallback, topK);
         }
 
         calculateLocalRelevanceScore(chunk, queryTokens, queryEntities, queryConcepts) {
@@ -3194,14 +3213,11 @@ Strict source-only: ${instructionProfile.strictSourceOnly ? 'yes' : 'no'}`;
         }
 
         async generatePreRetrievalPrediction(query) {
-            const predictionPrompt = `Based on general institutional policy knowledge, and without referring to any specific documents, what would you expect the answer to the following question to be? State your expectation in two to three sentences. Question: ${query}`;
+            const prompt = `Based on general institutional policy knowledge, and without referring to any specific documents, what would you expect the answer to the following question to be? State your expectation in two to three sentences. Question: ${query}`;
             try {
                 const prediction = await this.callCompletion([
-                    {
-                        role: 'system',
-                        content: 'You generate fast baseline expectations before evidence retrieval.'
-                    },
-                    { role: 'user', content: predictionPrompt }
+                    { role: 'system', content: 'Generate a short baseline expectation before evidence retrieval.' },
+                    { role: 'user', content: prompt }
                 ], {
                     model: 'gpt-4o-mini',
                     temperature: 0.2,
@@ -3210,7 +3226,7 @@ Strict source-only: ${instructionProfile.strictSourceOnly ? 'yes' : 'no'}`;
                 });
                 return this.cleanAssistantText(prediction);
             } catch (error) {
-                console.warn('Prediction step fallback:', error);
+                console.warn('Prediction call fallback:', error);
                 return '';
             }
         }
@@ -3226,30 +3242,16 @@ Strict source-only: ${instructionProfile.strictSourceOnly ? 'yes' : 'no'}`;
                 };
             }
 
-            const primaryRules = Array.isArray(schemaRaw.primaryRules)
-                ? schemaRaw.primaryRules
-                : Array.isArray(schemaRaw.rules)
-                    ? schemaRaw.rules
-                    : [];
-
-            const references = Array.isArray(schemaRaw.references)
-                ? schemaRaw.references
-                : Array.isArray(schemaRaw.crossReferences)
-                    ? schemaRaw.crossReferences
-                    : [];
-
-            const overrides = Array.isArray(schemaRaw.overrides)
-                ? schemaRaw.overrides
-                : Array.isArray(schemaRaw.exceptions)
-                    ? schemaRaw.exceptions
-                    : [];
+            const primaryRules = Array.isArray(schemaRaw.primaryRules) ? schemaRaw.primaryRules : [];
+            const references = Array.isArray(schemaRaw.references) ? schemaRaw.references : [];
+            const overrides = Array.isArray(schemaRaw.overrides) ? schemaRaw.overrides : [];
 
             return {
                 filename,
                 primaryRules: primaryRules.slice(0, 28),
                 references: references.slice(0, 24),
                 overrides: overrides.slice(0, 24),
-                generatedBy: schemaRaw.generatedBy === 'heuristic' ? 'heuristic' : 'model'
+                generatedBy: schemaRaw.generatedBy || 'heuristic'
             };
         }
 
@@ -3257,24 +3259,21 @@ Strict source-only: ${instructionProfile.strictSourceOnly ? 'yes' : 'no'}`;
             const fallback = this.normalizeSchemaPayload(document?.schema, document?.filename || 'Document');
             if (!this.apiKey) return fallback;
 
-            const schemaPrompt = `From the following document, extract: (1) the primary rules or policies it establishes, expressed as IF [condition] THEN [consequence] statements; (2) any references to other documents, policies, or systems by name; (3) any conditions under which the rules do not apply or are overridden. Return this as a structured summary, not as prose.
+            const prompt = `From the following document, extract: (1) the primary rules or policies it establishes, expressed as IF [condition] THEN [consequence] statements; (2) any references to other documents, policies, or systems by name; (3) any conditions under which the rules do not apply or are overridden. Return this as a structured summary, not as prose.
 
 Return strict JSON with keys:
-- primaryRules (array of objects with condition, consequence)
+- primaryRules (array of objects with condition and consequence)
 - references (array of strings)
 - overrides (array of strings)
 
 Document name: ${document?.filename || 'Document'}
-Document content:
+Document text:
 ${String(document?.fullText || '').slice(0, 52000)}`;
 
             try {
                 const raw = await this.callCompletion([
-                    {
-                        role: 'system',
-                        content: 'You extract structured institutional rule schemas. Return only valid JSON.'
-                    },
-                    { role: 'user', content: schemaPrompt }
+                    { role: 'system', content: 'Extract institutional schema as strict JSON only.' },
+                    { role: 'user', content: prompt }
                 ], {
                     model: 'gpt-4o-mini',
                     temperature: 0.1,
@@ -3283,7 +3282,10 @@ ${String(document?.fullText || '').slice(0, 52000)}`;
                 });
                 const parsed = this.safeJsonParse(raw);
                 if (!parsed) return fallback;
-                return this.normalizeSchemaPayload(parsed, document?.filename || 'Document');
+                return {
+                    ...this.normalizeSchemaPayload(parsed, document?.filename || 'Document'),
+                    generatedBy: 'model'
+                };
             } catch (error) {
                 console.warn('Schema extraction fallback:', error);
                 return fallback;
@@ -3291,11 +3293,8 @@ ${String(document?.fullText || '').slice(0, 52000)}`;
         }
 
         async assessInternalConfidence(query, answer, sources = []) {
-            if (!this.apiKey) {
-                return { level: 'medium', gaps: [] };
-            }
-
-            const confidencePrompt = `Assess confidence for this draft answer.
+            if (!this.apiKey) return { level: 'medium', gaps: [] };
+            const prompt = `Assess confidence for this draft answer.
 Question: ${query}
 Answer: ${answer}
 Available sources: ${sources.length}
@@ -3305,21 +3304,17 @@ Use this scale:
 - medium: some claims require inference across sources
 - low: evidence is insufficient for a complete answer
 
-Return strict JSON with:
+Return strict JSON with keys:
 - level (high|medium|low)
-- gaps (array of short missing-evidence notes)`;
-
+- gaps (array of short missing evidence notes)`;
             try {
                 const raw = await this.callCompletion([
-                    {
-                        role: 'system',
-                        content: 'You perform internal confidence assessment for source-grounded answers. Return only JSON.'
-                    },
-                    { role: 'user', content: confidencePrompt }
+                    { role: 'system', content: 'Assess confidence for RAG answers and return JSON only.' },
+                    { role: 'user', content: prompt }
                 ], {
                     model: 'gpt-4o-mini',
                     temperature: 0,
-                    max_tokens: 280,
+                    max_tokens: 300,
                     top_p: 0.9
                 });
                 const parsed = this.safeJsonParse(raw) || {};
@@ -3338,7 +3333,7 @@ Return strict JSON with:
             const gaps = Array.isArray(confidence.gaps) ? confidence.gaps.join(' ; ') : '';
             return `${query}
 Evidence gaps to resolve: ${gaps}
-Prioritize exceptions, overrides, eligibility conditions, definitions, and conflicting clauses.`;
+Prioritize exceptions, overrides, contradictions, and narrow applicability conditions.`;
         }
 
         estimateChunkChars(chunks = []) {
@@ -3688,18 +3683,17 @@ Only use the provided batch. Do not generalize beyond it.`
         }
 
         stripInternalSectionHeaders(text) {
-            const blocked = [
+            let output = String(text || '');
+            const blockedPatterns = [
                 /^mental model\b.*$/gim,
                 /^cross-document\b.*$/gim,
                 /^uncertainty and limits\b.*$/gim,
-                /^direct findings\b.*$/gim,
-                /^cross-document synthesis\b.*$/gim
+                /^direct findings\b.*$/gim
             ];
-            let cleaned = String(text || '');
-            for (const regex of blocked) {
-                cleaned = cleaned.replace(regex, '').trim();
+            for (const pattern of blockedPatterns) {
+                output = output.replace(pattern, '').trim();
             }
-            return cleaned;
+            return output;
         }
 
         finalizeAssistantMessage(text, sources = [], instructionProfile = {}) {
@@ -3756,12 +3750,12 @@ Only use the provided batch. Do not generalize beyond it.`
                 if (filenameMatches.length === 0) continue;
 
                 if (!quoteLower) {
-                    const pageMatch = filenameMatches.some(source => {
+                    const pageMatched = filenameMatches.some(source => {
                         const sourcePage = String(source.page || '').trim().toLowerCase();
                         if (!citedPage || citedPage === 'n/a') return true;
                         return sourcePage === citedPage || sourcePage.includes(citedPage) || citedPage.includes(sourcePage);
                     });
-                    if (pageMatch) {
+                    if (pageMatched) {
                         valid++;
                         continue;
                     }
@@ -3880,10 +3874,8 @@ Only use the provided batch. Do not generalize beyond it.`
         maybeViolatesOutputContract(text, instructionProfile = {}) {
             const citationCount = this.countCitations(text);
             if (citationCount === 0) return true;
-
             if (/^#{1,6}\s+/m.test(text)) return true;
-            if (/^\s*(Mental model|Cross-document|Uncertainty and limits|Direct findings)\b/i.test(text)) return true;
-            if (/\b(Mental model|Cross-document synthesis|Uncertainty and limits)\b/i.test(text)) return true;
+            if (/\b(Mental model|Cross-document synthesis|Uncertainty and limits|Direct findings)\b/i.test(text)) return true;
 
             return false;
         }
@@ -3906,7 +3898,7 @@ ${(diagnostics.weakClaims || []).join('\n') || '- none'}
 If the answer violates instructions or lacks proper citations, repair it.
 Always preserve factual grounding and keep citations in format:
 [Source: filename, Page X].
-Do not use section headers, labels, or meta-cognitive framing.
+Do not use section headers or meta-cognitive labels in output.
 Remove decorative or unusual special characters.
 Return only the repaired answer text.`
                 },
@@ -3988,18 +3980,16 @@ ${workingMemorySummary}`;
             if (!documentSchemas.length) return '';
             const lines = ['## Institutional rule schema - use this to understand how the rules relate before reading the evidence.'];
             for (const schema of documentSchemas.slice(0, 12)) {
-                const primaryRules = (schema.primaryRules || []).slice(0, 8).map((rule, idx) => {
-                    const condition = rule.condition || 'condition not explicitly extracted';
-                    const consequence = rule.consequence || rule.text || 'consequence not explicitly extracted';
+                const rules = (schema.primaryRules || []).slice(0, 8).map((rule, idx) => {
+                    const condition = rule.condition || 'condition in source';
+                    const consequence = rule.consequence || rule.text || 'consequence in source';
                     return `${idx + 1}. IF ${condition} THEN ${consequence}`;
                 });
-                const refs = (schema.references || []).slice(0, 8);
-                const overrides = (schema.overrides || []).slice(0, 8);
                 lines.push(`### ${schema.filename || 'Document'}
 - Primary rules:
-${primaryRules.length ? primaryRules.join('\n') : '- none extracted'}
-- References: ${refs.length ? refs.join('; ') : 'none extracted'}
-- Overrides/non-applicability: ${overrides.length ? overrides.join(' ; ') : 'none extracted'}`);
+${rules.length ? rules.join('\n') : '- none extracted'}
+- References: ${(schema.references || []).slice(0, 8).join('; ') || 'none extracted'}
+- Overrides/non-applicability: ${(schema.overrides || []).slice(0, 8).join(' ; ') || 'none extracted'}`);
             }
             return lines.join('\n');
         }
@@ -4020,14 +4010,14 @@ The following are exception clauses from the loaded documents. Read these with p
             const lines = [
                 '## Precedent from prior institutional reasoning - these are real cases that were previously resolved using this corpus.'
             ];
-            cases.slice(0, 3).forEach((item, idx) => {
-                const docSet = (item.documentSet || []).join(', ') || 'No document list';
-                lines.push(`### Case ${idx + 1}
+            for (const [index, item] of cases.slice(0, 3).entries()) {
+                const docSet = Array.isArray(item.documentSet) ? item.documentSet.join(', ') : 'N/A';
+                lines.push(`### Case ${index + 1}
 - Timestamp: ${item.timestamp || 'N/A'}
 - Prior query: ${item.query || 'N/A'}
-- Document set: ${docSet}
+- Document set: ${docSet || 'N/A'}
 - Prior answer summary: ${String(item.answer || '').slice(0, 800)}`);
-            });
+            }
             return lines.join('\n');
         }
 
@@ -4037,23 +4027,20 @@ The following are exception clauses from the loaded documents. Read these with p
                 '## IDENTIFIED CONTRADICTIONS',
                 'The following contradiction has been identified in the corpus. The answer must acknowledge and resolve this conflict.'
             ];
-            alerts.slice(0, 10).forEach((alert, idx) => {
-                lines.push(`### Contradiction ${idx + 1}
-- Concept: ${alert.concept || 'N/A'}
-- Source A: ${alert.sourceA || 'N/A'}
-- Position A: ${alert.positionA || 'N/A'}
-- Source B: ${alert.sourceB || 'N/A'}
-- Position B: ${alert.positionB || 'N/A'}`);
-            });
+            for (const [index, item] of alerts.slice(0, 10).entries()) {
+                lines.push(`### Contradiction ${index + 1}
+- Concept: ${item.concept || 'N/A'}
+- Source A: ${item.sourceA || 'N/A'}
+- Position A: ${item.positionA || 'N/A'}
+- Source B: ${item.sourceB || 'N/A'}
+- Position B: ${item.positionB || 'N/A'}`);
+            }
             return lines.join('\n');
         }
 
         formatFullCorpusContext(fullCorpusDocs = []) {
             if (!fullCorpusDocs.length) return '';
-            const blocks = fullCorpusDocs.map(doc => {
-                return `### Document: ${doc.filename}
-${String(doc.fullText || '').trim()}`;
-            });
+            const blocks = fullCorpusDocs.map(doc => `### Document: ${doc.filename}\n${String(doc.fullText || '').trim()}`);
             return `## FULL CORPUS INJECTION (GLOBAL BROADCAST)\n${blocks.join('\n\n---\n\n')}`;
         }
 
@@ -4105,10 +4092,10 @@ ${fallback.text.slice(0, Math.min(2500, fallback.text.length))}`);
                 `User question:\n${query}`,
                 '',
                 'Response contract:',
-                '- Provide a complete answer in professional prose with no section headers.',
+                '- Provide complete professional prose with no section headers or labels.',
                 '- After each factual sentence, include inline citation [Source: filename, Page X].',
-                '- Use only provided context. If evidence is missing, state that naturally in prose.',
-                '- Do not add meta-cognitive labels or decorative symbols.'
+                '- Use only provided context; if missing, state limits naturally within prose.',
+                '- Do not include meta-cognitive labels or decorative symbols.'
             ];
             return lines.join('\n');
         }
@@ -4327,10 +4314,10 @@ ${conceptSummary}`);
             }
 
             if (fullCorpusActive) {
-                const fullCorpusContext = this.formatFullCorpusContext(corpusStats.fullCorpusDocs || []);
-                contextSections.push(fullCorpusContext);
+                const fullContext = this.formatFullCorpusContext(corpusStats.fullCorpusDocs || []);
+                contextSections.push(fullContext);
                 formattedContext = {
-                    contextText: fullCorpusContext,
+                    contextText: fullContext,
                     included: (corpusStats.fullCorpusDocs || []).length,
                     omitted: 0
                 };
@@ -4397,11 +4384,9 @@ ${attachmentEvidence.contextText}`);
             if (corpusStats.contradictionTargetedChunks?.length) {
                 sources = [...corpusStats.contradictionTargetedChunks, ...sources];
             }
-
             if (fullCorpusActive && corpusStats.fullCorpusChunks?.length) {
                 sources = [...corpusStats.fullCorpusChunks, ...sources];
             }
-
             if (attachmentContext?.chunks) {
                 const attachmentSources = attachmentContext.chunks.map(chunk => ({
                     ...chunk,
@@ -4411,14 +4396,12 @@ ${attachmentEvidence.contextText}`);
                 }));
                 sources = [...attachmentSources, ...sources];
             }
-            const dedupedSourceMap = new Map();
+            const sourceMap = new Map();
             for (const source of sources) {
                 const key = source.id || `${source.filename}:${source.page || 'N/A'}:${(source.text || '').slice(0, 80)}`;
-                if (!dedupedSourceMap.has(key)) {
-                    dedupedSourceMap.set(key, source);
-                }
+                if (!sourceMap.has(key)) sourceMap.set(key, source);
             }
-            sources = Array.from(dedupedSourceMap.values());
+            sources = Array.from(sourceMap.values());
 
             const availableSourceCount = sources.length;
             assistantMessage = this.finalizeAssistantMessage(assistantMessage, sources, instructionProfile);
@@ -4744,9 +4727,9 @@ ${attachmentEvidence.contextText}`);
             this.retriever.updateCorpus(documents);
             this.updateCorpusUI(documents);
 
-            const skipContradictionRefresh = options.refreshContradictions === false;
-            if (skipContradictionRefresh || this.contradictionRebuildInFlight) return;
-
+            if (options.refreshContradictions === false || this.contradictionRebuildInFlight) {
+                return;
+            }
             this.contradictionRebuildInFlight = true;
             setTimeout(async () => {
                 try {
@@ -4824,7 +4807,19 @@ ${attachmentEvidence.contextText}`);
 
                 try {
                     const document = await this.processor.processFile(file);
-                    await this.db.addDocument(document);
+                    const docId = await this.db.addDocument(document);
+                    if (this.synthesizer.apiKey) {
+                        setTimeout(async () => {
+                            try {
+                                const schema = await this.synthesizer.extractInstitutionalSchema(document);
+                                if (schema?.generatedBy === 'model') {
+                                    await this.db.updateDocument(docId, { ...document, schema });
+                                }
+                            } catch (error) {
+                                console.warn('Background schema enrichment skipped:', error);
+                            }
+                        }, 0);
+                    }
                     processed++;
                     this.showToast(`Processed: ${file.name}`, 'success');
                 } catch (error) {
@@ -4969,7 +4964,6 @@ ${attachmentEvidence.contextText}`);
             const textA = this.normalizeRuleText(ruleA);
             const textB = this.normalizeRuleText(ruleB);
             if (!textA || !textB) return false;
-
             const tokensA = this.tokenizeForSimilarity(textA);
             const tokensB = this.tokenizeForSimilarity(textB);
             const overlap = this.getTokenOverlap(tokensA, tokensB);
@@ -4979,7 +4973,6 @@ ${attachmentEvidence.contextText}`);
             const negB = /\b(not|must not|may not|cannot|prohibited|ineligible|does not apply)\b/.test(textB);
             const posA = /\b(must|shall|required|permitted|eligible|applies)\b/.test(textA);
             const posB = /\b(must|shall|required|permitted|eligible|applies)\b/.test(textB);
-
             if ((negA && posB) || (negB && posA)) return true;
             if (/\boverride|exception|unless|except\b/.test(textA) && /\bmust|shall|required\b/.test(textB)) return true;
             if (/\boverride|exception|unless|except\b/.test(textB) && /\bmust|shall|required\b/.test(textA)) return true;
@@ -4996,17 +4989,14 @@ ${attachmentEvidence.contextText}`);
                     const docB = docs[j];
                     const rulesA = (docA.schema?.primaryRules || []).slice(0, 10);
                     const rulesB = (docB.schema?.primaryRules || []).slice(0, 10);
-
                     for (const ruleA of rulesA) {
                         for (const ruleB of rulesB) {
                             if (!this.areRulesContradictory(ruleA, ruleB)) continue;
-
                             const textA = this.normalizeRuleText(ruleA);
                             const textB = this.normalizeRuleText(ruleB);
                             const tokensA = this.tokenizeForSimilarity(textA);
                             const tokensB = this.tokenizeForSimilarity(textB);
                             const shared = Array.from(tokensA).filter(token => tokensB.has(token)).slice(0, 4);
-
                             entries.push({
                                 timestamp: new Date().toISOString(),
                                 concept: shared.join(', ') || 'policy conflict',
@@ -5015,84 +5005,68 @@ ${attachmentEvidence.contextText}`);
                                 positionA: `${ruleA.condition || ''} ${ruleA.consequence || ruleA.text || ''}`.trim(),
                                 positionB: `${ruleB.condition || ''} ${ruleB.consequence || ruleB.text || ''}`.trim()
                             });
-
-                            if (entries.length >= 180) {
-                                break outer;
-                            }
+                            if (entries.length >= 180) break outer;
                         }
                     }
                 }
-
                 if (i > 0 && i % 8 === 0) {
                     await wait(0);
                 }
             }
-
             await this.db.replaceContradictions(entries.slice(0, 120));
         }
 
         async getRelevantContradictions(query, limit = 6) {
             const all = await this.db.getAllContradictions();
             if (!all.length) return [];
-
             const queryTokens = this.tokenizeForSimilarity(query);
             const ranked = all.map(item => {
                 const conceptTokens = this.tokenizeForSimilarity(item.concept || '');
                 const overlap = this.getTokenOverlap(queryTokens, conceptTokens);
-                const sourceText = `${item.positionA || ''} ${item.positionB || ''}`;
-                const sourceOverlap = this.getTokenOverlap(queryTokens, this.tokenizeForSimilarity(sourceText));
-                return {
-                    ...item,
-                    score: (overlap * 0.65) + (sourceOverlap * 0.35)
-                };
+                const sourceTokens = this.tokenizeForSimilarity(`${item.positionA || ''} ${item.positionB || ''}`);
+                const sourceOverlap = this.getTokenOverlap(queryTokens, sourceTokens);
+                return { ...item, score: (overlap * 0.65) + (sourceOverlap * 0.35) };
             }).sort((a, b) => b.score - a.score);
-
             return ranked.filter(item => item.score > 0.06).slice(0, limit);
         }
 
         lexicalSimilarity(a, b) {
-            const tokensA = this.tokenizeForSimilarity(a);
-            const tokensB = this.tokenizeForSimilarity(b);
-            return this.getTokenOverlap(tokensA, tokensB);
+            const aTokens = this.tokenizeForSimilarity(a);
+            const bTokens = this.tokenizeForSimilarity(b);
+            return this.getTokenOverlap(aTokens, bTokens);
         }
 
         async retrieveSimilarCases(query, limit = 3) {
             const cases = await this.db.getAllCases();
             if (!cases.length) return [];
-
             let queryEmbedding = null;
             if (this.retriever.embeddingApiKey) {
                 queryEmbedding = await this.retriever.getQueryEmbedding(`case retrieval: ${query}`);
             }
-
-            const scored = [];
-            for (const item of cases) {
+            const scored = cases.map(item => {
                 let score = 0;
                 if (queryEmbedding && Array.isArray(item.embedding) && item.embedding.length === queryEmbedding.length) {
                     score = this.retriever.cosineSimilarity(queryEmbedding, item.embedding);
                 } else {
                     score = this.lexicalSimilarity(query, item.query || '');
                 }
-                scored.push({ ...item, score });
-            }
-
-            return scored
-                .sort((a, b) => b.score - a.score)
-                .slice(0, limit);
+                return { ...item, score };
+            });
+            return scored.sort((a, b) => b.score - a.score).slice(0, limit);
         }
 
         async storeResolvedCase(query, answer, documentSet = []) {
             let embedding = null;
             if (this.retriever.embeddingApiKey) {
                 try {
-                    const embeddingInput = `Query: ${query}\nAnswer summary: ${String(answer || '').slice(0, 1500)}`;
-                    const vectors = await this.retriever.embedTextBatch([embeddingInput]);
+                    const vectors = await this.retriever.embedTextBatch([
+                        `Query: ${query}\nAnswer summary: ${String(answer || '').slice(0, 1500)}`
+                    ]);
                     embedding = vectors?.[0] || null;
                 } catch (error) {
                     console.warn('Case embedding fallback:', error);
                 }
             }
-
             await this.db.addCase({
                 timestamp: new Date().toISOString(),
                 query: String(query || '').slice(0, 2000),
@@ -5219,12 +5193,8 @@ ${attachmentEvidence.contextText}`);
                 const contradictionAlerts = hasCorpus ? await this.getRelevantContradictions(query, 6) : [];
 
                 const fullCorpusDocs = contextDecision.strategy === 'FULL_CORPUS'
-                    ? this.retriever.documents.map(doc => ({
-                        filename: doc.filename,
-                        fullText: doc.fullText
-                    }))
+                    ? this.retriever.documents.map(doc => ({ filename: doc.filename, fullText: doc.fullText }))
                     : [];
-
                 const fullCorpusChunks = contextDecision.strategy === 'FULL_CORPUS'
                     ? this.retriever.documents.flatMap(doc => doc.chunks || [])
                     : [];
@@ -5268,21 +5238,16 @@ ${attachmentEvidence.contextText}`);
                     const gapChunks = await this.retriever.retrieve(gapQuery, null, {
                         intent: { ...intent, broadCoverage: true }
                     });
-                    const mergedChunks = this.retriever.mergeUniqueChunks(
+                    const merged = this.retriever.mergeUniqueChunks(
                         relevantChunks,
                         gapChunks,
                         Math.max((relevantChunks.length || 0) + 14, 30)
                     );
-                    const requeryStats = {
-                        ...corpusStats,
-                        lowConfidenceRequery: true,
-                        gapQuery
-                    };
                     result = await this.synthesizer.synthesize(
                         query,
-                        mergedChunks,
+                        merged,
                         attachmentContext,
-                        requeryStats,
+                        { ...corpusStats, lowConfidenceRequery: true, gapQuery },
                         { persistResult: false }
                     );
                 }
@@ -5311,11 +5276,7 @@ ${attachmentEvidence.contextText}`);
                 }
 
                 if (hasCorpus) {
-                    await this.storeResolvedCase(
-                        query,
-                        result.response,
-                        Array.from(inScopeFilenames)
-                    );
+                    await this.storeResolvedCase(query, result.response, Array.from(inScopeFilenames));
                 }
             } catch (error) {
                 console.error('Error:', error);
@@ -5443,10 +5404,7 @@ ${attachmentEvidence.contextText}`);
                 return nameMatches && pageMatches;
             });
             if (!match?.text) return 'Relevant source passage not extracted in citation payload.';
-            const sentence = String(match.text)
-                .replace(/\s+/g, ' ')
-                .trim()
-                .split(/(?<=[.!?])\s+/)[0];
+            const sentence = String(match.text).replace(/\s+/g, ' ').trim().split(/(?<=[.!?])\s+/)[0];
             return sentence.slice(0, 320);
         }
 
