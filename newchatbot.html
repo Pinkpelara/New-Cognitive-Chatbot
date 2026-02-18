@@ -686,6 +686,26 @@
             background: rgba(239, 68, 68, 0.1);
         }
 
+        .status-card {
+            margin-top: 1rem;
+            padding: 1rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg);
+        }
+
+        .status-card h4 {
+            margin-bottom: 0.5rem;
+            font-size: 0.95rem;
+            color: var(--primary);
+        }
+
+        .status-card p {
+            margin: 0.35rem 0;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+        }
+
         .processing-status {
             margin-top: 1rem;
             padding: 1rem;
@@ -892,7 +912,7 @@
             UofT Cognitive Synthesis Engine
         </h1>
         <div class="header-actions">
-            <span class="brain-badge">Brain-Aligned RAG</span>
+            <span class="brain-badge" id="headerDocIndicator">0 documents loaded</span>
             <button class="header-btn" id="openAdminBtn" title="Open Admin Panel (Ctrl+Shift+A)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="3"/>
@@ -907,8 +927,8 @@
         <section class="chat-section">
             <div class="chat-header">
                 <div class="chat-header-info">
-                    <h2>Knowledge Synthesis Interface</h2>
-                    <p>Ask questions to synthesize insights across your document corpus</p>
+                    <h2>Document Reasoning Interface</h2>
+                    <p>Ask questions using your loaded documents.</p>
                 </div>
                 <div class="chat-header-actions">
                     <button class="chat-action-btn" id="clearChatBtn" title="Clear Chat History">
@@ -922,7 +942,7 @@
 
             <div class="chat-messages" id="chatMessages">
                 <div class="message system">
-                    Welcome! This engine performs <strong>cognitive synthesis</strong> by combining broad coverage retrieval, concept links, and instruction-aware response formatting.
+                    Welcome. This tool reasons across your uploaded documents and provides fully cited answers.
                     <br><br>
                     Click the <strong>Admin Panel</strong> button (or press Ctrl+Shift+A) to upload documents and configure your API key.
                     <br><br>
@@ -932,7 +952,7 @@
 
             <div class="synthesis-indicator" id="synthesisIndicator">
                 <div class="pulse"></div>
-                <span id="synthesisIndicatorText">Building mental model and synthesizing across documents...</span>
+                <span id="synthesisIndicatorText">Reviewing documents and preparing a cited response...</span>
             </div>
 
             <div class="chat-input-container">
@@ -964,7 +984,7 @@
                     <textarea
                         class="chat-input"
                         id="chatInput"
-                        placeholder="Ask a question to synthesize knowledge from your documents..."
+                        placeholder="Ask a question using your loaded documents..."
                         rows="2"
                     ></textarea>
                     <button class="send-btn" id="sendBtn">
@@ -1000,7 +1020,7 @@
                             <rect x="3" y="14" width="7" height="7"/>
                             <rect x="14" y="14" width="7" height="7"/>
                         </svg>
-                        0 knowledge chunks
+                        0 documents loaded
                     </span>
                 </div>
             </div>
@@ -1050,7 +1070,7 @@
                             <option value="gpt-4o">GPT-4o (Balanced)</option>
                             <option value="gpt-4o-mini">GPT-4o mini (Faster)</option>
                         </select>
-                        <p class="model-note">For long-document synthesis, use GPT-4.1 or GPT-4o. The engine applies multi-stage retrieval + memory to improve brain-like integration.</p>
+                        <p class="model-note">For complex multi-document queries, use GPT-4.1 or GPT-4o.</p>
                     </div>
                 </div>
 
@@ -1104,6 +1124,12 @@
                         Run Eval Harness
                     </button>
                 </div>
+
+                <div class="status-card" id="adminStatusCard">
+                    <h4>Admin Diagnostics</h4>
+                    <p id="adminContextStrategy">Context strategy: not run yet</p>
+                    <p id="adminEvalOutput">Evaluation metrics will appear here after responses.</p>
+                </div>
             </div>
         </div>
     </div>
@@ -1134,8 +1160,10 @@
 
     <script>
     const DB_NAME = 'CognitiveSynthesisDB';
-    const DB_VERSION = 2;
+    const DB_VERSION = 3;
     const STORE_NAME = 'documents';
+    const CASE_STORE_NAME = 'case_memory';
+    const CONTRADICTION_STORE_NAME = 'contradiction_registry';
 
     const LONG_DOC_WORD_THRESHOLD = 12000;
     const MAX_CONTEXT_CHARS = 90000;
@@ -1156,6 +1184,20 @@
     const EMBEDDING_MAX_RETRIES = 2;
     const RETRY_BASE_DELAY_MS = 600;
     const EMBEDDING_DISABLE_WINDOW_MS = 5 * 60 * 1000;
+    const FULL_CORPUS_TOKEN_LIMIT = 100000;
+    const SYNTHESIS_MAX_TOKENS = 8000;
+    const EXCEPTION_MARKERS = [
+        'unless',
+        'except',
+        'notwithstanding',
+        'provided that',
+        'subject to',
+        'does not apply',
+        'only if',
+        'in the case of',
+        'by way of exception',
+        'override'
+    ];
     const REFUSAL_PATTERNS = [
         /cannot\s+(?:directly\s+)?access/i,
         /outside of (?:the )?provided excerpts/i,
@@ -1245,6 +1287,30 @@
         throw lastError || buildHttpError('Request failed after retries', null, false);
     }
 
+    function loadOptionalScript(src) {
+        return new Promise((resolve, reject) => {
+            if ([...document.scripts].some(script => script.src === src)) {
+                resolve();
+                return;
+            }
+            const script = document.createElement('script');
+            script.src = src;
+            script.async = true;
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error(`Failed to load optional script: ${src}`));
+            document.head.appendChild(script);
+        });
+    }
+
+    async function ensureTokenizerLibrary() {
+        if (window.tiktoken || window.jsTiktoken) return;
+        try {
+            await loadOptionalScript('https://cdn.jsdelivr.net/npm/js-tiktoken@1.0.14/dist/index.js');
+        } catch (error) {
+            console.warn('Tokenizer library unavailable, falling back to heuristic token estimation.', error);
+        }
+    }
+
     function simpleHash(input) {
         const text = String(input || '');
         let hash = 2166136261;
@@ -1277,6 +1343,18 @@
                         const store = db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
                         store.createIndex('filename', 'filename', { unique: false });
                         store.createIndex('type', 'type', { unique: false });
+                    }
+
+                    if (!db.objectStoreNames.contains(CASE_STORE_NAME)) {
+                        const caseStore = db.createObjectStore(CASE_STORE_NAME, { keyPath: 'id', autoIncrement: true });
+                        caseStore.createIndex('timestamp', 'timestamp', { unique: false });
+                        caseStore.createIndex('query', 'query', { unique: false });
+                    }
+
+                    if (!db.objectStoreNames.contains(CONTRADICTION_STORE_NAME)) {
+                        const contradictionStore = db.createObjectStore(CONTRADICTION_STORE_NAME, { keyPath: 'id', autoIncrement: true });
+                        contradictionStore.createIndex('concept', 'concept', { unique: false });
+                        contradictionStore.createIndex('timestamp', 'timestamp', { unique: false });
                     }
                 };
             });
@@ -1319,6 +1397,76 @@
                 const request = store.clear();
                 request.onsuccess = () => resolve();
                 request.onerror = () => reject(request.error);
+            });
+        }
+
+        async updateDocument(id, updatedDoc) {
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction(STORE_NAME, 'readwrite');
+                const store = tx.objectStore(STORE_NAME);
+                const request = store.put({
+                    ...updatedDoc,
+                    id
+                });
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error);
+            });
+        }
+
+        async addCase(caseRecord) {
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction(CASE_STORE_NAME, 'readwrite');
+                const store = tx.objectStore(CASE_STORE_NAME);
+                const request = store.add(caseRecord);
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error);
+            });
+        }
+
+        async getAllCases() {
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction(CASE_STORE_NAME, 'readonly');
+                const store = tx.objectStore(CASE_STORE_NAME);
+                const request = store.getAll();
+                request.onsuccess = () => resolve(request.result || []);
+                request.onerror = () => reject(request.error);
+            });
+        }
+
+        async clearCases() {
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction(CASE_STORE_NAME, 'readwrite');
+                const store = tx.objectStore(CASE_STORE_NAME);
+                const request = store.clear();
+                request.onsuccess = () => resolve();
+                request.onerror = () => reject(request.error);
+            });
+        }
+
+        async getAllContradictions() {
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction(CONTRADICTION_STORE_NAME, 'readonly');
+                const store = tx.objectStore(CONTRADICTION_STORE_NAME);
+                const request = store.getAll();
+                request.onsuccess = () => resolve(request.result || []);
+                request.onerror = () => reject(request.error);
+            });
+        }
+
+        async replaceContradictions(entries = []) {
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction(CONTRADICTION_STORE_NAME, 'readwrite');
+                const store = tx.objectStore(CONTRADICTION_STORE_NAME);
+                const clearRequest = store.clear();
+                clearRequest.onerror = () => reject(clearRequest.error);
+                clearRequest.onsuccess = () => {
+                    for (const entry of entries) {
+                        store.add(entry);
+                    }
+                };
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+                tx.onabort = () => reject(tx.error);
             });
         }
     }
@@ -1383,6 +1531,75 @@
                 .split(/(?<=[.!?])\s+(?=[A-Z0-9"“'`])/)
                 .map(s => s.trim())
                 .filter(Boolean);
+        }
+
+        hasExceptionMarker(sentence) {
+            const lower = String(sentence || '').toLowerCase();
+            return EXCEPTION_MARKERS.some(marker => lower.includes(marker));
+        }
+
+        extractExceptionIndex(chunks, filename) {
+            const exceptions = [];
+            const seen = new Set();
+
+            for (const chunk of (chunks || [])) {
+                const sentences = this.splitIntoSentences(chunk.text || '');
+                for (const sentenceRaw of sentences) {
+                    const sentence = sentenceRaw.trim();
+                    if (sentence.length < 20) continue;
+                    if (!this.hasExceptionMarker(sentence)) continue;
+                    const key = `${filename}::${chunk.page || 'N/A'}::${sentence.toLowerCase()}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    exceptions.push({
+                        id: `${chunk.id}-exception-${exceptions.length}`,
+                        filename,
+                        page: chunk.page || 'N/A',
+                        chunkId: chunk.id,
+                        text: sentence
+                    });
+                }
+            }
+
+            return exceptions;
+        }
+
+        buildHeuristicSchema(text, filename = 'Document') {
+            const sentences = this.splitIntoSentences(text || '').slice(0, 180);
+            const rules = [];
+            const references = new Set();
+            const overrides = [];
+
+            const rulePattern = /\b(must|shall|required|is required|may|permitted|prohibited|must not|may not|cannot|will)\b/i;
+            const referencePattern = /\b(ROSI|ACORN|Registrar|Faculty|Policy|Procedure|Calendar|Guideline|Act|Regulation)\b/gi;
+
+            for (const sentenceRaw of sentences) {
+                const sentence = sentenceRaw.trim();
+                if (!sentence) continue;
+
+                if (rulePattern.test(sentence) || /\bif\b.+\bthen\b/i.test(sentence)) {
+                    const ifThen = sentence.match(/\bif\b(.+?)\bthen\b(.+)/i);
+                    rules.push({
+                        condition: ifThen ? ifThen[1].trim() : 'Condition stated in source sentence',
+                        consequence: ifThen ? ifThen[2].trim() : sentence
+                    });
+                }
+
+                const refs = sentence.match(referencePattern) || [];
+                for (const ref of refs) references.add(ref);
+
+                if (this.hasExceptionMarker(sentence)) {
+                    overrides.push(sentence);
+                }
+            }
+
+            return {
+                filename,
+                primaryRules: rules.slice(0, 20),
+                references: Array.from(references).slice(0, 20),
+                overrides: overrides.slice(0, 20),
+                generatedBy: 'heuristic'
+            };
         }
 
         tokenizeForMemory(text) {
@@ -1677,6 +1894,8 @@
 
             const chunks = this.intelligentChunk(text, file.name);
             const memory = this.buildDocumentMemory(text, chunks, file.name);
+            const exceptionIndex = this.extractExceptionIndex(chunks, file.name);
+            const schema = this.buildHeuristicSchema(text, file.name);
 
             return {
                 filename: file.name,
@@ -1686,7 +1905,9 @@
                 uploadedAt: new Date().toISOString(),
                 fullText: text,
                 chunks,
-                memory
+                memory,
+                exceptionIndex,
+                schema
             };
         }
 
@@ -1789,6 +2010,8 @@
         constructor() {
             this.documents = [];
             this.allChunks = [];
+            this.exceptionIndex = [];
+            this.exceptionIndexByFilename = new Map();
             this.idf = new Map();
             this.avgChunkLength = 1;
             this.chunkTokenCache = new Map();
@@ -1805,12 +2028,119 @@
             this.lastEmbeddingError = '';
             this.embeddingFailureCount = 0;
             this.embeddingDisabledUntil = 0;
+            this.estimatedCorpusTokens = 0;
+            this.contextStrategy = 'HYBRID_RETRIEVAL';
+            this.tokenEncoder = null;
         }
 
         setEmbeddingApiKey(apiKey) {
             this.embeddingApiKey = apiKey || '';
             this.embeddingFailureCount = 0;
             this.embeddingDisabledUntil = 0;
+        }
+
+        estimateTokenCount(text) {
+            const normalized = String(text || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (!normalized) return 0;
+
+            try {
+                if (!this.tokenEncoder && window.tiktoken?.encoding_for_model) {
+                    this.tokenEncoder = window.tiktoken.encoding_for_model('gpt-4o');
+                } else if (!this.tokenEncoder && window.jsTiktoken?.encodingForModel) {
+                    this.tokenEncoder = window.jsTiktoken.encodingForModel('gpt-4o');
+                }
+
+                if (this.tokenEncoder?.encode) {
+                    const encoded = this.tokenEncoder.encode(normalized);
+                    if (Array.isArray(encoded) || typeof encoded?.length === 'number') {
+                        return Math.max(1, encoded.length);
+                    }
+                }
+            } catch (error) {
+                // Fallback to heuristic estimation when tokenizer is unavailable.
+            }
+
+            // Approximate token estimation for GPT-family models.
+            const roughWordTokens = normalized.split(' ').length;
+            const punctuationTokens = (normalized.match(/[.,;:!?()[\]{}]/g) || []).length;
+            const numericTokens = (normalized.match(/\b\d+(?:\.\d+)?\b/g) || []).length;
+            const estimated = Math.round((roughWordTokens * 1.18) + (punctuationTokens * 0.35) + (numericTokens * 0.2));
+            return Math.max(1, estimated);
+        }
+
+        estimateDocumentTokens(doc) {
+            const fullText = String(doc?.fullText || '');
+            if (!fullText) {
+                return this.estimateTokenCount((doc?.chunks || []).map(chunk => chunk.text || '').join('\n'));
+            }
+            return this.estimateTokenCount(fullText);
+        }
+
+        getCorpusTokenEstimate() {
+            if (this.documents.length === 0) return 0;
+            return this.documents.reduce((sum, doc) => sum + this.estimateDocumentTokens(doc), 0);
+        }
+
+        getContextStrategy() {
+            const totalTokens = this.getCorpusTokenEstimate();
+            const strategy = totalTokens > 0 && totalTokens <= FULL_CORPUS_TOKEN_LIMIT
+                ? 'FULL_CORPUS'
+                : 'HYBRID_RETRIEVAL';
+            this.estimatedCorpusTokens = totalTokens;
+            this.contextStrategy = strategy;
+            return {
+                strategy,
+                totalTokens,
+                limit: FULL_CORPUS_TOKEN_LIMIT
+            };
+        }
+
+        buildExceptionIndex() {
+            this.exceptionIndex = [];
+            this.exceptionIndexByFilename.clear();
+
+            for (const doc of this.documents) {
+                let exceptions = Array.isArray(doc.exceptionIndex) ? doc.exceptionIndex : [];
+                if (!exceptions.length) {
+                    exceptions = (doc.chunks || [])
+                        .flatMap(chunk => {
+                            const sentences = String(chunk.text || '')
+                                .split(/(?<=[.!?])\s+|\n+/)
+                                .map(item => item.trim())
+                                .filter(Boolean);
+                            return sentences
+                                .filter(sentence => EXCEPTION_MARKERS.some(marker => sentence.toLowerCase().includes(marker)))
+                                .map((sentence, idx) => ({
+                                    id: `${chunk.id || `${doc.filename}-${idx}`}-exception`,
+                                    filename: doc.filename,
+                                    page: chunk.page || 'N/A',
+                                    chunkId: chunk.id,
+                                    text: sentence
+                                }));
+                        })
+                        .slice(0, 120);
+                }
+
+                this.exceptionIndexByFilename.set(doc.filename, exceptions);
+                this.exceptionIndex.push(...exceptions);
+            }
+        }
+
+        getExceptionClausesForDocuments(filenames = []) {
+            const selected = [];
+            const seen = new Set();
+            for (const filename of filenames) {
+                const exceptions = this.exceptionIndexByFilename.get(filename) || [];
+                for (const entry of exceptions) {
+                    const key = `${entry.filename}:${entry.page}:${entry.text}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    selected.push(entry);
+                }
+            }
+            return selected;
         }
 
         normalizeEmbeddingText(text, maxChars = 2200) {
@@ -1975,10 +2305,18 @@
 
         updateCorpus(documents) {
             this.documents = documents.map(doc => {
-                if (doc.memory) return doc;
+                if (doc.memory && doc.exceptionIndex && doc.schema) return doc;
                 return {
                     ...doc,
-                    memory: this.deriveMemoryFromChunks(doc)
+                    memory: doc.memory || this.deriveMemoryFromChunks(doc),
+                    exceptionIndex: doc.exceptionIndex || [],
+                    schema: doc.schema || {
+                        filename: doc.filename,
+                        primaryRules: [],
+                        references: [],
+                        overrides: [],
+                        generatedBy: 'heuristic'
+                    }
                 };
             });
 
@@ -1988,6 +2326,11 @@
             this.chunkEmbeddingTextCache.clear();
             this.buildTokenStats();
             this.buildConceptIndex();
+            this.buildExceptionIndex();
+            this.estimatedCorpusTokens = this.getCorpusTokenEstimate();
+            this.contextStrategy = this.estimatedCorpusTokens <= FULL_CORPUS_TOKEN_LIMIT && this.estimatedCorpusTokens > 0
+                ? 'FULL_CORPUS'
+                : 'HYBRID_RETRIEVAL';
         }
 
         deriveMemoryFromChunks(doc) {
@@ -2426,6 +2769,38 @@
             return merged;
         }
 
+        buildContradictionTargetedQuery(query, prediction = '') {
+            const base = String(query || '').trim();
+            const expected = String(prediction || '').trim();
+            return `${base}
+Expected baseline answer:
+${expected}
+
+Retrieve clauses that may contradict, limit, override, or narrow the expected answer. Prioritize: unless, except, notwithstanding, provided that, subject to, does not apply, only if, in the case of, by way of exception, override.`;
+        }
+
+        async retrieveContradictionTargeted(query, prediction = '', topK = 10) {
+            if (!this.allChunks.length) return [];
+            const targetedQuery = this.buildContradictionTargetedQuery(query, prediction);
+            const queryTokens = this.tokenize(targetedQuery);
+            const exceptionRegex = /\b(unless|except|notwithstanding|provided that|subject to|does not apply|only if|in the case of|by way of exception|override)\b/i;
+
+            const scored = this.allChunks.map(chunk => {
+                const baseScore = this.calculateLocalRelevanceScore(chunk, queryTokens, [], []);
+                const chunkLower = String(chunk.text || '').toLowerCase();
+                const hasException = exceptionRegex.test(chunkLower);
+                const contradictionCue = /\b(however|but|not|except|unless|override|contrary|despite)\b/i.test(chunkLower);
+                let score = baseScore;
+                if (hasException) score += 0.4;
+                if (contradictionCue) score += 0.18;
+                return { ...chunk, score, hasException };
+            }).sort((a, b) => b.score - a.score);
+
+            const hardMatches = scored.filter(item => item.hasException).slice(0, Math.ceil(topK * 0.8));
+            const fallback = scored.slice(0, Math.ceil(topK * 0.6));
+            return this.mergeUniqueChunks(hardMatches, fallback, topK);
+        }
+
         calculateLocalRelevanceScore(chunk, queryTokens, queryEntities, queryConcepts) {
             const chunkTokens = this.tokenize(chunk.text);
             const chunkTokenSet = new Set(chunkTokens);
@@ -2642,18 +3017,12 @@
         }
 
         buildInstructionProfile(query) {
-            const lower = query.toLowerCase();
-            const wordLimitMatch = query.match(/(\d{2,4})\s*words?/i);
-
             return {
-                requestedFormat: /\btable\b/.test(lower) ? 'table' :
-                    /\b(json)\b/.test(lower) ? 'json' :
-                    /\b(bullet|bulleted|list|points)\b/.test(lower) ? 'bullet list' :
-                    'structured prose',
-                wantsSteps: /\b(step[- ]by[- ]step|steps)\b/.test(lower),
-                wordLimit: wordLimitMatch ? parseInt(wordLimitMatch[1], 10) : null,
-                strictSourceOnly: /\b(only use|based only|strictly from|from provided|from uploaded)\b/.test(lower),
-                userIntent: lower
+                requestedFormat: 'professional prose',
+                wantsSteps: false,
+                wordLimit: null,
+                strictSourceOnly: true,
+                userIntent: String(query || '').toLowerCase()
             };
         }
 
@@ -2678,6 +3047,15 @@
                 gist
             });
             this.saveWorkingMemory();
+        }
+
+        persistConversationTurn(query, response) {
+            this.conversationHistory.push(
+                { role: 'user', content: query },
+                { role: 'assistant', content: response }
+            );
+            this.saveChatHistory();
+            this.rememberTurn(query, response);
         }
 
         safeJsonParse(rawText) {
@@ -2806,6 +3184,154 @@ Strict source-only: ${instructionProfile.strictSourceOnly ? 'yes' : 'no'}`;
             }
         }
 
+        async generatePreRetrievalPrediction(query) {
+            const predictionPrompt = `Based on general institutional policy knowledge, and without referring to any specific documents, what would you expect the answer to the following question to be? State your expectation in two to three sentences. Question: ${query}`;
+            try {
+                const prediction = await this.callCompletion([
+                    {
+                        role: 'system',
+                        content: 'You generate fast baseline expectations before evidence retrieval.'
+                    },
+                    { role: 'user', content: predictionPrompt }
+                ], {
+                    model: 'gpt-4o-mini',
+                    temperature: 0.2,
+                    max_tokens: 500,
+                    top_p: 0.9
+                });
+                return this.cleanAssistantText(prediction);
+            } catch (error) {
+                console.warn('Prediction step fallback:', error);
+                return '';
+            }
+        }
+
+        normalizeSchemaPayload(schemaRaw, filename = 'Document') {
+            if (!schemaRaw || typeof schemaRaw !== 'object') {
+                return {
+                    filename,
+                    primaryRules: [],
+                    references: [],
+                    overrides: [],
+                    generatedBy: 'heuristic'
+                };
+            }
+
+            const primaryRules = Array.isArray(schemaRaw.primaryRules)
+                ? schemaRaw.primaryRules
+                : Array.isArray(schemaRaw.rules)
+                    ? schemaRaw.rules
+                    : [];
+
+            const references = Array.isArray(schemaRaw.references)
+                ? schemaRaw.references
+                : Array.isArray(schemaRaw.crossReferences)
+                    ? schemaRaw.crossReferences
+                    : [];
+
+            const overrides = Array.isArray(schemaRaw.overrides)
+                ? schemaRaw.overrides
+                : Array.isArray(schemaRaw.exceptions)
+                    ? schemaRaw.exceptions
+                    : [];
+
+            return {
+                filename,
+                primaryRules: primaryRules.slice(0, 28),
+                references: references.slice(0, 24),
+                overrides: overrides.slice(0, 24),
+                generatedBy: schemaRaw.generatedBy === 'heuristic' ? 'heuristic' : 'model'
+            };
+        }
+
+        async extractInstitutionalSchema(document) {
+            const fallback = this.normalizeSchemaPayload(document?.schema, document?.filename || 'Document');
+            if (!this.apiKey) return fallback;
+
+            const schemaPrompt = `From the following document, extract: (1) the primary rules or policies it establishes, expressed as IF [condition] THEN [consequence] statements; (2) any references to other documents, policies, or systems by name; (3) any conditions under which the rules do not apply or are overridden. Return this as a structured summary, not as prose.
+
+Return strict JSON with keys:
+- primaryRules (array of objects with condition, consequence)
+- references (array of strings)
+- overrides (array of strings)
+
+Document name: ${document?.filename || 'Document'}
+Document content:
+${String(document?.fullText || '').slice(0, 52000)}`;
+
+            try {
+                const raw = await this.callCompletion([
+                    {
+                        role: 'system',
+                        content: 'You extract structured institutional rule schemas. Return only valid JSON.'
+                    },
+                    { role: 'user', content: schemaPrompt }
+                ], {
+                    model: 'gpt-4o-mini',
+                    temperature: 0.1,
+                    max_tokens: 750,
+                    top_p: 0.85
+                });
+                const parsed = this.safeJsonParse(raw);
+                if (!parsed) return fallback;
+                return this.normalizeSchemaPayload(parsed, document?.filename || 'Document');
+            } catch (error) {
+                console.warn('Schema extraction fallback:', error);
+                return fallback;
+            }
+        }
+
+        async assessInternalConfidence(query, answer, sources = []) {
+            if (!this.apiKey) {
+                return { level: 'medium', gaps: [] };
+            }
+
+            const confidencePrompt = `Assess confidence for this draft answer.
+Question: ${query}
+Answer: ${answer}
+Available sources: ${sources.length}
+
+Use this scale:
+- high: every claim is directly supported by cited sources
+- medium: some claims require inference across sources
+- low: evidence is insufficient for a complete answer
+
+Return strict JSON with:
+- level (high|medium|low)
+- gaps (array of short missing-evidence notes)`;
+
+            try {
+                const raw = await this.callCompletion([
+                    {
+                        role: 'system',
+                        content: 'You perform internal confidence assessment for source-grounded answers. Return only JSON.'
+                    },
+                    { role: 'user', content: confidencePrompt }
+                ], {
+                    model: 'gpt-4o-mini',
+                    temperature: 0,
+                    max_tokens: 280,
+                    top_p: 0.9
+                });
+                const parsed = this.safeJsonParse(raw) || {};
+                const level = ['high', 'medium', 'low'].includes(parsed.level) ? parsed.level : 'medium';
+                const gaps = Array.isArray(parsed.gaps)
+                    ? parsed.gaps.filter(item => typeof item === 'string' && item.trim()).slice(0, 8)
+                    : [];
+                return { level, gaps };
+            } catch (error) {
+                console.warn('Confidence assessment fallback:', error);
+                return { level: 'medium', gaps: [] };
+            }
+        }
+
+        buildGapRetrievalQuery(query, confidence = { level: 'medium', gaps: [] }) {
+            const gaps = Array.isArray(confidence.gaps) ? confidence.gaps.join(' ; ') : '';
+            return `${query}
+Evidence gaps to resolve: ${gaps}
+Prioritize exceptions, overrides, eligibility conditions, definitions, and conflicting clauses.`;
+        }
+
         estimateChunkChars(chunks = []) {
             return chunks.reduce((sum, chunk) => sum + (chunk.text?.length || 0), 0);
         }
@@ -2909,7 +3435,7 @@ Rules:
 - Use concise bullet points.
 - Include only findings supported by this batch.
 - Every bullet must include citation in exact format:
-  [Source: filename, page X, "brief relevant quote"]
+  [Source: filename, Page X]
 - End with one line: "Batch confidence: High/Medium/Low"`;
 
                 const mapMessages = [
@@ -2944,7 +3470,7 @@ Only use the provided batch. Do not generalize beyond it.`
         }
 
         countCitations(text) {
-            return (text.match(/\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+,\s*"[^"]+"\]/gi) || []).length;
+            return (String(text || '').match(/\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+(?:,\s*"[^"]+")?\]/gi) || []).length;
         }
 
         tokenizeForDiagnostics(text) {
@@ -2966,7 +3492,7 @@ Only use the provided batch. Do not generalize beyond it.`
         }
 
         extractCitations(text) {
-            const regex = /\[Source:\s*([^,\]]+),\s*(?:page\s*)?([^,\]]+),\s*"([^"]+)"\]/gi;
+            const regex = /\[Source:\s*([^,\]]+),\s*(?:page\s*)?([^,\]]+)(?:,\s*"([^"]+)")?\]/gi;
             const citations = [];
             let match;
             while ((match = regex.exec(text)) !== null) {
@@ -3049,7 +3575,7 @@ Only use the provided batch. Do not generalize beyond it.`
             quote = this.cleanQuoteText(quote);
             if (!quote) return null;
 
-            return `[Source: ${bestSource.filenameDisplay || 'Unknown Source'}, page ${bestSource.page}, "${quote}"]`;
+            return `[Source: ${bestSource.filenameDisplay || 'Unknown Source'}, Page ${bestSource.page}]`;
         }
 
         cleanAssistantText(text) {
@@ -3109,7 +3635,7 @@ Only use the provided batch. Do not generalize beyond it.`
 
             const sourceCaches = this.buildSourceCaches(sources);
             const lines = String(text).split('\n');
-            const citationRegex = /\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+,\s*"[^"]+"\]/i;
+            const citationRegex = /\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+(?:,\s*"[^"]+")?\]/i;
             let injected = 0;
             const maxInject = 20;
 
@@ -3149,52 +3675,28 @@ Only use the provided batch. Do not generalize beyond it.`
         }
 
         ensureHumanAnalysisStructure(text, sources = [], instructionProfile = {}) {
-            if (!text) return text;
-            if (instructionProfile.requestedFormat === 'json' || instructionProfile.requestedFormat === 'table') {
-                return text;
+            return this.cleanAssistantText(text);
+        }
+
+        stripInternalSectionHeaders(text) {
+            const blocked = [
+                /^mental model\b.*$/gim,
+                /^cross-document\b.*$/gim,
+                /^uncertainty and limits\b.*$/gim,
+                /^direct findings\b.*$/gim,
+                /^cross-document synthesis\b.*$/gim
+            ];
+            let cleaned = String(text || '');
+            for (const regex of blocked) {
+                cleaned = cleaned.replace(regex, '').trim();
             }
-            if (instructionProfile.requestedFormat === 'bullet list') {
-                return text;
-            }
-
-            const normalized = this.cleanAssistantText(text);
-            const lower = normalized.toLowerCase();
-            const hasMental = /mental model/i.test(lower);
-            const hasCross = /cross-document|across documents|synthesizing across/i.test(lower);
-            const hasUncertainty = /uncertainty|limits|cannot fully confirm|based on the available documents/i.test(lower);
-            if (hasMental && hasCross && hasUncertainty) {
-                return normalized;
-            }
-
-            const paragraphs = normalized
-                .split(/\n{2,}/)
-                .map(paragraph => paragraph.trim())
-                .filter(Boolean);
-
-            const p1 = paragraphs[0] || normalized;
-            const p2 = paragraphs.slice(1).join('\n\n') || p1;
-            const uncertaintyText = 'Based on the available documents, remaining uncertainty depends on sections where evidence is incomplete, conflicting, or implicit.';
-
-            const sourceCaches = this.buildSourceCaches(sources);
-            const attachCitationIfMissing = (body) => {
-                if (/\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+,\s*"[^"]+"\]/i.test(body)) {
-                    return body;
-                }
-                const citation = this.buildCitationForClaim(body, sourceCaches);
-                return citation ? `${body} ${citation}` : body;
-            };
-
-            return [
-                `Mental model (macro/meso/micro):\n${attachCitationIfMissing(p1)}`,
-                `Cross-document synthesis and implications:\n${attachCitationIfMissing(p2)}`,
-                `Uncertainty and limits:\n${attachCitationIfMissing(uncertaintyText)}`
-            ].join('\n\n');
+            return cleaned;
         }
 
         finalizeAssistantMessage(text, sources = [], instructionProfile = {}) {
             let output = this.cleanAssistantText(text);
             output = this.enforceCitationCoverage(output, sources, instructionProfile);
-            output = this.ensureHumanAnalysisStructure(output, sources, instructionProfile);
+            output = this.stripInternalSectionHeaders(output);
             output = this.cleanAssistantText(output);
             return output;
         }
@@ -3232,8 +3734,9 @@ Only use the provided batch. Do not generalize beyond it.`
             let valid = 0;
             for (const citation of citations) {
                 const citedName = this.normalizeFilename(citation.filename);
-                const quoteLower = citation.quote.toLowerCase();
+                const quoteLower = String(citation.quote || '').toLowerCase();
                 const quoteTokens = this.tokenizeForDiagnostics(quoteLower);
+                const citedPage = String(citation.page || '').trim().toLowerCase();
 
                 const filenameMatches = sourceCaches.filter(source =>
                     source.filename === citedName ||
@@ -3242,6 +3745,18 @@ Only use the provided batch. Do not generalize beyond it.`
                 );
 
                 if (filenameMatches.length === 0) continue;
+
+                if (!quoteLower) {
+                    const pageMatch = filenameMatches.some(source => {
+                        const sourcePage = String(source.page || '').trim().toLowerCase();
+                        if (!citedPage || citedPage === 'n/a') return true;
+                        return sourcePage === citedPage || sourcePage.includes(citedPage) || citedPage.includes(sourcePage);
+                    });
+                    if (pageMatch) {
+                        valid++;
+                        continue;
+                    }
+                }
 
                 let quoteSupported = false;
                 for (const source of filenameMatches) {
@@ -3306,7 +3821,7 @@ Only use the provided batch. Do not generalize beyond it.`
             const citationPrecision = this.evaluateCitationPrecision(citations, sourceCaches);
 
             const claimEvaluations = claims.map(claim => {
-                const hasCitation = /\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+,\s*"[^"]+"\]/i.test(claim);
+                const hasCitation = /\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+(?:,\s*"[^"]+")?\]/i.test(claim);
                 const supportScore = this.computeClaimSupportScore(claim, sourceCaches);
                 return { claim, hasCitation, supportScore };
             });
@@ -3357,23 +3872,9 @@ Only use the provided batch. Do not generalize beyond it.`
             const citationCount = this.countCitations(text);
             if (citationCount === 0) return true;
 
-            if (instructionProfile.requestedFormat === 'json') {
-                const trimmed = text.trim();
-                if (!(trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.includes('```json'))) {
-                    return true;
-                }
-            }
-
-            if (instructionProfile.requestedFormat === 'table') {
-                if (!/\|.+\|/.test(text)) return true;
-            }
-
-            if (instructionProfile.wordLimit) {
-                const words = text.split(/\s+/).filter(Boolean).length;
-                if (words > Math.ceil(instructionProfile.wordLimit * 1.25)) {
-                    return true;
-                }
-            }
+            if (/^#{1,6}\s+/m.test(text)) return true;
+            if (/^\s*(Mental model|Cross-document|Uncertainty and limits|Direct findings)\b/i.test(text)) return true;
+            if (/\b(Mental model|Cross-document synthesis|Uncertainty and limits)\b/i.test(text)) return true;
 
             return false;
         }
@@ -3395,8 +3896,8 @@ ${(diagnostics.weakClaims || []).join('\n') || '- none'}
                     content: `You are a response verifier for strict RAG answers.
 If the answer violates instructions or lacks proper citations, repair it.
 Always preserve factual grounding and keep citations in format:
-[Source: filename, page X, "brief relevant quote"].
-Ensure response has human-like analysis depth (mental model, cross-document links, and uncertainty).
+[Source: filename, Page X].
+Do not use section headers, labels, or meta-cognitive framing.
 Remove decorative or unusual special characters.
 Return only the repaired answer text.`
                 },
@@ -3429,62 +3930,31 @@ ${answer}`
         }
 
         getSystemPrompt(context, corpusStats = {}, instructionProfile = {}, workingMemorySummary = '') {
-            const numDocs = corpusStats.numDocs || 0;
-            const numChunks = corpusStats.numChunks || 0;
-            const formatReq = instructionProfile.requestedFormat || 'structured prose';
-            const stepReq = instructionProfile.wantsSteps ? 'Yes' : 'No';
-            const wordLimit = instructionProfile.wordLimit ? `${instructionProfile.wordLimit} words` : 'No explicit limit';
-            const sourceOnly = instructionProfile.strictSourceOnly ? 'Yes - strictly source-grounded.' : 'Ground all factual claims in provided sources.';
+            return `You are an institutional reasoning engine. Your sole function is to reason across the documents loaded into this session and produce precise, fully-cited answers.
 
-            return `You are a COGNITIVE SYNTHESIS ENGINE.
+CLOSED UNIVERSE: The documents provided are your only source of truth. You have no access to outside knowledge during this session. You do not know anything that is not in the provided context. If the corpus does not contain information needed to answer a question, you state that clearly within your answer.
 
-You are given:
-1) Retrieved evidence chunks from uploaded documents.
-2) Document-memory summaries generated from full uploaded files (outline, key concepts, salient sentences).
-3) Optional temporary attachment memory for one-time analysis.
+BEFORE YOU ANSWER: You must complete three internal steps. Do not skip any of them. Do not show them in your output.
 
-IMPORTANT ACCESS RULE:
-- If context is provided, NEVER claim you cannot access the documents.
-- Never mention "training cutoff" unless user explicitly asks about model knowledge limits.
-- If evidence is missing, say: "Based on the available documents, I cannot fully confirm..."
+Step 1 - Build the complete picture. Read all provided context. Map every rule, definition, condition, and exception. Identify how rules in different documents relate to each other. Note every use of words like unless, except, notwithstanding, subject to, and provided that - these mark the exceptions that most often determine the correct answer. Identify any contradictions between sources.
 
-Human-like synthesis mode (inspired by brain-mimicking LLM research):
-- Working-memory loop: obey the current instruction contract precisely.
-- Semantic-memory loop: use document-memory summaries to maintain long-range context.
-- Retrieval loop: verify claims against cited chunks before finalizing.
-- Planner loop: decompose complex queries into sub-questions before writing.
-- Map-reduce loop: aggregate distributed evidence across long contexts.
-- Verifier loop: self-check instruction compliance and citation completeness.
+Step 2 - Reason from the complete picture. Connect the relevant rules across documents. Apply the exceptions and conditions you identified. If there is a contradiction between sources, determine which source governs this specific situation and why. Form your complete answer based on this reasoning, not based on the first relevant passage you find.
 
-Corpus snapshot:
-- Documents: ${numDocs}
-- Chunks: ${numChunks}
+Step 3 - Verify. Check every claim you intend to make. Confirm it is directly supported by a specific passage in the corpus. Identify the exact source file and page number for each claim. If a claim cannot be verified, either remove it or explicitly flag it as inference.
 
-Instruction contract:
-- Output format: ${formatReq}
-- Step-by-step required: ${stepReq}
-- Length target: ${wordLimit}
-- Source policy: ${sourceOnly}
+OUTPUT FORMAT: Write a complete, precise answer in professional prose. Do not use section headers, labels, or any structural markers. After every sentence that contains a factual claim, immediately add the citation in the format [Source: filename, Page X]. Write the way a senior expert would write a professional memo: directly, thoroughly, and with every claim attributed to its source.
 
-MANDATORY CITATION FORMAT:
-[Source: filename, page X, "brief relevant quote"]
+If the corpus contradicts itself on a point relevant to the answer, state both positions, cite both sources, and explain which governs and why.
 
-RESPONSE SHAPE (unless user explicitly requests a different structure):
-1) Mental model (macro/meso/micro synthesis)
-2) Cross-document links, tensions, and implications
-3) Uncertainty and limits from provided evidence
+If the corpus does not contain information needed to fully answer the question, say so within the prose rather than as a separate section.
 
-MAXIMIZATION GOAL:
-- Deliver complete, high-recall, high-precision synthesis across all provided sources.
-- Behave like a "super-analyst" only through better retrieval + planning + verification.
-- Never invent evidence, never claim hidden access, never skip citations for factual claims.
+Do not use the phrases "Mental model," "Cross-document synthesis," "Uncertainty and limits," "Direct findings," or any other meta-cognitive label in your output. Those are your internal processes. The user sees only the answer.
 
 CONTEXT:
 ${context}
 
 WORKING MEMORY FROM PRIOR TURNS:
-${workingMemorySummary}
-`;
+${workingMemorySummary}`;
         }
 
         formatDocumentMemories(documentMemories = []) {
@@ -3503,6 +3973,79 @@ ${workingMemorySummary}
             });
 
             return `## DOCUMENT MEMORY BLOCKS (generated from full files)\n${blocks.join('\n\n')}`;
+        }
+
+        formatSchemasForContext(documentSchemas = []) {
+            if (!documentSchemas.length) return '';
+            const lines = ['## Institutional rule schema - use this to understand how the rules relate before reading the evidence.'];
+            for (const schema of documentSchemas.slice(0, 12)) {
+                const primaryRules = (schema.primaryRules || []).slice(0, 8).map((rule, idx) => {
+                    const condition = rule.condition || 'condition not explicitly extracted';
+                    const consequence = rule.consequence || rule.text || 'consequence not explicitly extracted';
+                    return `${idx + 1}. IF ${condition} THEN ${consequence}`;
+                });
+                const refs = (schema.references || []).slice(0, 8);
+                const overrides = (schema.overrides || []).slice(0, 8);
+                lines.push(`### ${schema.filename || 'Document'}
+- Primary rules:
+${primaryRules.length ? primaryRules.join('\n') : '- none extracted'}
+- References: ${refs.length ? refs.join('; ') : 'none extracted'}
+- Overrides/non-applicability: ${overrides.length ? overrides.join(' ; ') : 'none extracted'}`);
+            }
+            return lines.join('\n');
+        }
+
+        formatExceptionClauses(exceptionClauses = []) {
+            if (!exceptionClauses.length) return '';
+            const intro = `## EXCEPTION CLAUSES
+The following are exception clauses from the loaded documents. Read these with particular care before answering, as they may override the general rules that appear elsewhere in the corpus.`;
+            const lines = exceptionClauses.slice(0, 220).map((item, idx) => {
+                const page = item.page ? `Page ${item.page}` : 'Page N/A';
+                return `${idx + 1}. ${item.filename} (${page}) - ${item.text}`;
+            });
+            return `${intro}\n${lines.join('\n')}`;
+        }
+
+        formatPrecedentCases(cases = []) {
+            if (!cases.length) return '';
+            const lines = [
+                '## Precedent from prior institutional reasoning - these are real cases that were previously resolved using this corpus.'
+            ];
+            cases.slice(0, 3).forEach((item, idx) => {
+                const docSet = (item.documentSet || []).join(', ') || 'No document list';
+                lines.push(`### Case ${idx + 1}
+- Timestamp: ${item.timestamp || 'N/A'}
+- Prior query: ${item.query || 'N/A'}
+- Document set: ${docSet}
+- Prior answer summary: ${String(item.answer || '').slice(0, 800)}`);
+            });
+            return lines.join('\n');
+        }
+
+        formatContradictionAlerts(alerts = []) {
+            if (!alerts.length) return '';
+            const lines = [
+                '## IDENTIFIED CONTRADICTIONS',
+                'The following contradiction has been identified in the corpus. The answer must acknowledge and resolve this conflict.'
+            ];
+            alerts.slice(0, 10).forEach((alert, idx) => {
+                lines.push(`### Contradiction ${idx + 1}
+- Concept: ${alert.concept || 'N/A'}
+- Source A: ${alert.sourceA || 'N/A'}
+- Position A: ${alert.positionA || 'N/A'}
+- Source B: ${alert.sourceB || 'N/A'}
+- Position B: ${alert.positionB || 'N/A'}`);
+            });
+            return lines.join('\n');
+        }
+
+        formatFullCorpusContext(fullCorpusDocs = []) {
+            if (!fullCorpusDocs.length) return '';
+            const blocks = fullCorpusDocs.map(doc => {
+                return `### Document: ${doc.filename}
+${String(doc.fullText || '').trim()}`;
+            });
+            return `## FULL CORPUS INJECTION (GLOBAL BROADCAST)\n${blocks.join('\n\n---\n\n')}`;
         }
 
         formatContext(chunks, maxChars = MAX_CONTEXT_CHARS) {
@@ -3552,13 +4095,11 @@ ${fallback.text.slice(0, Math.min(2500, fallback.text.length))}`);
             const lines = [
                 `User question:\n${query}`,
                 '',
-                'Please obey this response contract:',
-                `- Format: ${instructionProfile.requestedFormat}`,
-                `- Step-by-step: ${instructionProfile.wantsSteps ? 'yes' : 'no'}`,
-                `- Word limit: ${instructionProfile.wordLimit ? instructionProfile.wordLimit : 'no strict limit'}`,
-                `- Source-only strictness: ${instructionProfile.strictSourceOnly ? 'strict' : 'grounded, with clear uncertainty if missing'}`,
-                '- Provide human-like analysis (mental model + cross-document connections + uncertainty).',
-                '- Avoid decorative symbols or unusual special characters.'
+                'Response contract:',
+                '- Provide a complete answer in professional prose with no section headers.',
+                '- After each factual sentence, include inline citation [Source: filename, Page X].',
+                '- Use only provided context. If evidence is missing, state that naturally in prose.',
+                '- Do not add meta-cognitive labels or decorative symbols.'
             ];
             return lines.join('\n');
         }
@@ -3692,7 +4233,7 @@ ${fallback.text.slice(0, Math.min(2500, fallback.text.length))}`);
             throw lastError || new Error('Completion request failed');
         }
 
-        async synthesize(query, relevantChunks, attachmentContext = null, corpusStats = {}) {
+        async synthesize(query, relevantChunks, attachmentContext = null, corpusStats = {}, options = {}) {
             if (!this.apiKey) {
                 throw new Error('API key not configured. Please set your OpenAI API key in the Admin Panel.');
             }
@@ -3700,10 +4241,36 @@ ${fallback.text.slice(0, Math.min(2500, fallback.text.length))}`);
             const instructionProfile = this.buildInstructionProfile(query);
             const workingMemorySummary = this.getWorkingMemorySummary();
             const cognitivePlan = await this.buildCognitivePlan(query, instructionProfile, corpusStats, attachmentContext);
-            const useMultiPass = this.shouldUseMultiPass(relevantChunks, attachmentContext, corpusStats, cognitivePlan);
+            const contextStrategy = corpusStats.contextStrategy || 'HYBRID_RETRIEVAL';
+            const fullCorpusActive = contextStrategy === 'FULL_CORPUS' && (corpusStats.fullCorpusDocs || []).length > 0;
+            const useMultiPass = fullCorpusActive
+                ? false
+                : this.shouldUseMultiPass(relevantChunks, attachmentContext, corpusStats, cognitivePlan);
 
             const contextSections = [];
+            if (corpusStats.documentSchemas && corpusStats.documentSchemas.length > 0) {
+                contextSections.push(this.formatSchemasForContext(corpusStats.documentSchemas));
+            }
+
             contextSections.push(this.formatPlanForContext(cognitivePlan));
+
+            if (corpusStats.preRetrievalPrediction) {
+                contextSections.push(`## PRE-RETRIEVAL EXPECTATION
+Predicted baseline answer before evidence review:
+${corpusStats.preRetrievalPrediction}`);
+            }
+
+            if (corpusStats.precedentCases && corpusStats.precedentCases.length > 0) {
+                contextSections.push(this.formatPrecedentCases(corpusStats.precedentCases));
+            }
+
+            if (corpusStats.exceptionClauses && corpusStats.exceptionClauses.length > 0) {
+                contextSections.push(this.formatExceptionClauses(corpusStats.exceptionClauses));
+            }
+
+            if (corpusStats.contradictionAlerts && corpusStats.contradictionAlerts.length > 0) {
+                contextSections.push(this.formatContradictionAlerts(corpusStats.contradictionAlerts));
+            }
 
             if (attachmentContext?.memory) {
                 const m = attachmentContext.memory;
@@ -3729,15 +4296,18 @@ ${attachmentContext.digest}`);
                     .slice(0, 10)
                     .map(item => `- "${item.concept}" appears in ${item.docCount} documents`)
                     .join('\n');
-                contextSections.push(`## CROSS-DOCUMENT CONCEPT BRIDGES\n${conceptSummary}`);
+                contextSections.push(`## CROSS-DOCUMENT CONCEPT BRIDGES
+The following concepts in your query appear across these documents. Read all of them carefully before answering.
+${conceptSummary}`);
             }
 
             if (corpusStats.corpusDigest) {
                 contextSections.push(`## CORPUS DIGEST\n${corpusStats.corpusDigest}`);
             }
 
+            let formattedContext = { contextText: '', included: 0, omitted: 0 };
             let mapNotes = [];
-            if (useMultiPass) {
+            if (!fullCorpusActive && useMultiPass) {
                 const evidenceBatches = this.buildEvidenceBatches(relevantChunks, attachmentContext);
                 if (evidenceBatches.length > 0) {
                     mapNotes = await this.runMapPhase(query, cognitivePlan, evidenceBatches);
@@ -3747,13 +4317,33 @@ ${attachmentContext.digest}`);
                 }
             }
 
-            const dynamicContextBudget = useMultiPass ? Math.floor(MAX_CONTEXT_CHARS * 0.58) : MAX_CONTEXT_CHARS;
-            const formattedContext = this.formatContext(relevantChunks, dynamicContextBudget);
-            contextSections.push(`## RETRIEVED EVIDENCE CHUNKS
+            if (fullCorpusActive) {
+                const fullCorpusContext = this.formatFullCorpusContext(corpusStats.fullCorpusDocs || []);
+                contextSections.push(fullCorpusContext);
+                formattedContext = {
+                    contextText: fullCorpusContext,
+                    included: (corpusStats.fullCorpusDocs || []).length,
+                    omitted: 0
+                };
+            } else {
+                const dynamicContextBudget = useMultiPass ? Math.floor(MAX_CONTEXT_CHARS * 0.58) : MAX_CONTEXT_CHARS;
+                formattedContext = this.formatContext(relevantChunks, dynamicContextBudget);
+                contextSections.push(`## RETRIEVED EVIDENCE CHUNKS
 Included chunks: ${formattedContext.included}
 Omitted due to context budget: ${formattedContext.omitted}
 
 ${formattedContext.contextText}`);
+            }
+
+            if (corpusStats.contradictionTargetedChunks && corpusStats.contradictionTargetedChunks.length > 0) {
+                const contradictionContext = this.formatContext(
+                    corpusStats.contradictionTargetedChunks,
+                    Math.floor(MAX_CONTEXT_CHARS * 0.25)
+                );
+                contextSections.push(`## potentially contradicting expected answer.
+Included chunks: ${contradictionContext.included}
+${contradictionContext.contextText}`);
+            }
 
             if (attachmentContext?.chunks && attachmentContext.chunks.length > 0) {
                 const attachmentBudget = useMultiPass ? Math.floor(MAX_CONTEXT_CHARS * 0.24) : Math.floor(MAX_CONTEXT_CHARS * 0.35);
@@ -3775,7 +4365,7 @@ ${attachmentEvidence.contextText}`);
                 { role: 'user', content: userPrompt }
             ];
 
-            let assistantMessage = await this.callCompletion(messages);
+            let assistantMessage = await this.callCompletion(messages, { max_tokens: SYNTHESIS_MAX_TOKENS });
             assistantMessage = this.cleanAssistantText(assistantMessage);
 
             if ((relevantChunks.length > 0 || (attachmentContext?.chunks?.length || 0) > 0) && this.looksLikeContextRefusal(assistantMessage)) {
@@ -3787,11 +4377,22 @@ ${attachmentEvidence.contextText}`);
                         content: 'You incorrectly stated you cannot access documents. Re-answer using the provided evidence and document-memory blocks above. Do not mention training cutoff unless explicitly asked. Keep strict citations.'
                     }
                 ];
-                assistantMessage = await this.callCompletion(retryMessages, { temperature: 0.15 });
+                assistantMessage = await this.callCompletion(retryMessages, {
+                    temperature: 0.15,
+                    max_tokens: SYNTHESIS_MAX_TOKENS
+                });
                 assistantMessage = this.cleanAssistantText(assistantMessage);
             }
 
             let sources = [...(relevantChunks || [])];
+            if (corpusStats.contradictionTargetedChunks?.length) {
+                sources = [...corpusStats.contradictionTargetedChunks, ...sources];
+            }
+
+            if (fullCorpusActive && corpusStats.fullCorpusChunks?.length) {
+                sources = [...corpusStats.fullCorpusChunks, ...sources];
+            }
+
             if (attachmentContext?.chunks) {
                 const attachmentSources = attachmentContext.chunks.map(chunk => ({
                     ...chunk,
@@ -3801,13 +4402,20 @@ ${attachmentEvidence.contextText}`);
                 }));
                 sources = [...attachmentSources, ...sources];
             }
+            const dedupedSourceMap = new Map();
+            for (const source of sources) {
+                const key = source.id || `${source.filename}:${source.page || 'N/A'}:${(source.text || '').slice(0, 80)}`;
+                if (!dedupedSourceMap.has(key)) {
+                    dedupedSourceMap.set(key, source);
+                }
+            }
+            sources = Array.from(dedupedSourceMap.values());
 
             const availableSourceCount = sources.length;
             assistantMessage = this.finalizeAssistantMessage(assistantMessage, sources, instructionProfile);
             let citationCount = this.countCitations(assistantMessage);
             const minimumCitationTarget = availableSourceCount >= 10 ? 4 : availableSourceCount >= 4 ? 2 : availableSourceCount > 0 ? 1 : 0;
             let claimDiagnostics = this.buildClaimCitationDiagnostics(assistantMessage, sources);
-            const missingHumanAnalysis = !this.hasHumanAnalysisMarkers(assistantMessage, instructionProfile) && availableSourceCount >= 2;
             const strictRepairNeeded = (
                 this.maybeViolatesOutputContract(assistantMessage, instructionProfile) ||
                 (availableSourceCount > 0 && citationCount < minimumCitationTarget)
@@ -3821,7 +4429,7 @@ ${attachmentEvidence.contextText}`);
                 )
             );
             const needsRepair = (
-                strictRepairNeeded || softRepairNeeded || missingHumanAnalysis
+                strictRepairNeeded || softRepairNeeded
             );
 
             if (needsRepair) {
@@ -3845,12 +4453,9 @@ ${attachmentEvidence.contextText}`);
 
             assistantMessage = this.finalizeAssistantMessage(assistantMessage, sources, instructionProfile);
 
-            this.conversationHistory.push(
-                { role: 'user', content: query },
-                { role: 'assistant', content: assistantMessage }
-            );
-            this.saveChatHistory();
-            this.rememberTurn(query, assistantMessage);
+            if (options.persistResult !== false) {
+                this.persistConversationTurn(query, assistantMessage);
+            }
 
             return {
                 response: assistantMessage,
@@ -3860,7 +4465,10 @@ ${attachmentEvidence.contextText}`);
                     cognitivePlan,
                     mapPassCount: mapNotes.length,
                     citationCount,
-                    claimDiagnostics
+                    claimDiagnostics,
+                    contextStrategy,
+                    corpusTokenEstimate: corpusStats.totalCorpusTokens || null,
+                    preRetrievalPrediction: corpusStats.preRetrievalPrediction || ''
                 }
             };
         }
@@ -3886,34 +4494,15 @@ ${attachmentEvidence.contextText}`);
         }
 
         countCitations(text) {
-            return (String(text || '').match(/\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+,\s*"[^"]+"\]/gi) || []).length;
+            return (String(text || '').match(/\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+(?:,\s*"[^"]+")?\]/gi) || []).length;
         }
 
         evaluateInstructionAdherence(response, instructionProfile = {}, claimDiagnostics = null) {
             const checks = [];
             const text = String(response || '');
 
-            if (instructionProfile.requestedFormat === 'json') {
-                const trimmed = text.trim();
-                checks.push(
-                    trimmed.startsWith('{') ||
-                    trimmed.startsWith('[') ||
-                    trimmed.includes('```json')
-                );
-            } else if (instructionProfile.requestedFormat === 'table') {
-                checks.push(/\|.+\|/.test(text));
-            } else if (instructionProfile.requestedFormat === 'bullet list') {
-                checks.push(/^\s*[-*]\s+/m.test(text) || /^\s*\d+\.\s+/m.test(text));
-            }
-
-            if (instructionProfile.wantsSteps) {
-                checks.push(/\bStep\s*1\b/i.test(text) || /^\s*1\.\s+/m.test(text));
-            }
-
-            if (instructionProfile.wordLimit) {
-                const words = text.split(/\s+/).filter(Boolean).length;
-                checks.push(words <= Math.ceil(instructionProfile.wordLimit * 1.25));
-            }
+            checks.push(!/^#{1,6}\s+/m.test(text));
+            checks.push(!/\b(Mental model|Cross-document synthesis|Uncertainty and limits|Direct findings)\b/i.test(text));
 
             if (instructionProfile.strictSourceOnly) {
                 checks.push(this.countCitations(text) > 0);
@@ -3999,7 +4588,7 @@ ${attachmentEvidence.contextText}`);
             this.synthesizer = synthesizer;
             this.evaluator = evaluator;
             this.currentAttachment = null;
-            this.defaultSynthesisText = 'Building mental model and synthesizing across documents...';
+            this.defaultSynthesisText = 'Reviewing documents and preparing a cited response...';
 
             this.initializeElements();
             this.bindEvents();
@@ -4025,6 +4614,7 @@ ${attachmentEvidence.contextText}`);
             this.corpusList = document.getElementById('corpusList');
             this.docCount = document.getElementById('docCount');
             this.chunkCount = document.getElementById('chunkCount');
+            this.headerDocIndicator = document.getElementById('headerDocIndicator');
 
             this.adminPanel = document.getElementById('adminPanel');
             this.adminClose = document.getElementById('adminClose');
@@ -4041,6 +4631,8 @@ ${attachmentEvidence.contextText}`);
             this.clearCorpusBtn = document.getElementById('clearCorpus');
             this.clearChatAdminBtn = document.getElementById('clearChatAdmin');
             this.runEvalHarnessBtn = document.getElementById('runEvalHarness');
+            this.adminContextStrategy = document.getElementById('adminContextStrategy');
+            this.adminEvalOutput = document.getElementById('adminEvalOutput');
 
             this.citationModal = document.getElementById('citationModal');
             this.citationClose = document.getElementById('citationClose');
@@ -4139,13 +4731,30 @@ ${attachmentEvidence.contextText}`);
 
         async loadCorpus() {
             const documents = await this.db.getAllDocuments();
-            this.retriever.updateCorpus(documents);
-            this.updateCorpusUI(documents);
+            const hydratedDocuments = [];
+
+            for (const doc of documents) {
+                let hydrated = doc;
+                const hasSchema = Array.isArray(doc.schema?.primaryRules) || Array.isArray(doc.schema?.rules);
+                const needsModelSchema = !!this.synthesizer.apiKey && doc.schema?.generatedBy !== 'model';
+                if (!hasSchema || needsModelSchema) {
+                    const schema = await this.synthesizer.extractInstitutionalSchema(doc);
+                    hydrated = { ...doc, schema };
+                    try {
+                        await this.db.updateDocument(doc.id, hydrated);
+                    } catch (error) {
+                        console.warn('Unable to persist refreshed schema:', error);
+                    }
+                }
+                hydratedDocuments.push(hydrated);
+            }
+
+            this.retriever.updateCorpus(hydratedDocuments);
+            await this.rebuildContradictionRegistry(hydratedDocuments);
+            this.updateCorpusUI(hydratedDocuments);
         }
 
         updateCorpusUI(documents) {
-            const totalChunks = documents.reduce((sum, doc) => sum + (doc.chunks?.length || 0), 0);
-
             this.docCount.innerHTML = `
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/>
@@ -4160,8 +4769,12 @@ ${attachmentEvidence.contextText}`);
                     <rect x="3" y="14" width="7" height="7"/>
                     <rect x="14" y="14" width="7" height="7"/>
                 </svg>
-                ${totalChunks} knowledge chunks
+                ${documents.length} documents loaded
             `;
+
+            if (this.headerDocIndicator) {
+                this.headerDocIndicator.textContent = `${documents.length} documents loaded`;
+            }
 
             if (documents.length === 0) {
                 this.corpusList.innerHTML = `
@@ -4178,7 +4791,7 @@ ${attachmentEvidence.contextText}`);
                     <div class="corpus-item-info">
                         <div class="corpus-item-name" title="${this.escapeHtml(doc.filename)}">${this.escapeHtml(doc.filename)}</div>
                         <div class="corpus-item-meta">
-                            ${(doc.size / 1024).toFixed(1)} KB • ${doc.chunks?.length || 0} chunks
+                            ${(doc.size / 1024).toFixed(1)} KB • ${doc.chunks?.length || 0} sections indexed
                         </div>
                     </div>
                     <button class="corpus-item-delete" onclick="app.deleteDocument(${doc.id})">
@@ -4206,7 +4819,12 @@ ${attachmentEvidence.contextText}`);
 
                 try {
                     const document = await this.processor.processFile(file);
-                    await this.db.addDocument(document);
+                    const schema = await this.synthesizer.extractInstitutionalSchema(document);
+                    const documentWithSchema = {
+                        ...document,
+                        schema: schema || document.schema
+                    };
+                    await this.db.addDocument(documentWithSchema);
                     processed++;
                     this.showToast(`Processed: ${file.name}`, 'success');
                 } catch (error) {
@@ -4322,9 +4940,163 @@ ${attachmentEvidence.contextText}`);
             }
         }
 
+        normalizeRuleText(rule) {
+            if (!rule) return '';
+            if (typeof rule === 'string') return rule.toLowerCase();
+            return `${rule.condition || ''} ${rule.consequence || rule.text || ''}`.toLowerCase();
+        }
+
+        tokenizeForSimilarity(text) {
+            return new Set(
+                String(text || '')
+                    .toLowerCase()
+                    .replace(/[^\w\s-]/g, ' ')
+                    .split(/\s+/)
+                    .filter(token => token.length > 2)
+            );
+        }
+
+        getTokenOverlap(setA, setB) {
+            if (!setA.size || !setB.size) return 0;
+            let overlap = 0;
+            for (const token of setA) {
+                if (setB.has(token)) overlap++;
+            }
+            return overlap / Math.max(1, Math.min(setA.size, setB.size));
+        }
+
+        areRulesContradictory(ruleA, ruleB) {
+            const textA = this.normalizeRuleText(ruleA);
+            const textB = this.normalizeRuleText(ruleB);
+            if (!textA || !textB) return false;
+
+            const tokensA = this.tokenizeForSimilarity(textA);
+            const tokensB = this.tokenizeForSimilarity(textB);
+            const overlap = this.getTokenOverlap(tokensA, tokensB);
+            if (overlap < 0.25) return false;
+
+            const negA = /\b(not|must not|may not|cannot|prohibited|ineligible|does not apply)\b/.test(textA);
+            const negB = /\b(not|must not|may not|cannot|prohibited|ineligible|does not apply)\b/.test(textB);
+            const posA = /\b(must|shall|required|permitted|eligible|applies)\b/.test(textA);
+            const posB = /\b(must|shall|required|permitted|eligible|applies)\b/.test(textB);
+
+            if ((negA && posB) || (negB && posA)) return true;
+            if (/\boverride|exception|unless|except\b/.test(textA) && /\bmust|shall|required\b/.test(textB)) return true;
+            if (/\boverride|exception|unless|except\b/.test(textB) && /\bmust|shall|required\b/.test(textA)) return true;
+            return false;
+        }
+
+        async rebuildContradictionRegistry(documents = []) {
+            const entries = [];
+            const docs = documents || [];
+
+            for (let i = 0; i < docs.length; i++) {
+                for (let j = i + 1; j < docs.length; j++) {
+                    const docA = docs[i];
+                    const docB = docs[j];
+                    const rulesA = (docA.schema?.primaryRules || []).slice(0, 20);
+                    const rulesB = (docB.schema?.primaryRules || []).slice(0, 20);
+
+                    for (const ruleA of rulesA) {
+                        for (const ruleB of rulesB) {
+                            if (!this.areRulesContradictory(ruleA, ruleB)) continue;
+
+                            const textA = this.normalizeRuleText(ruleA);
+                            const textB = this.normalizeRuleText(ruleB);
+                            const tokensA = this.tokenizeForSimilarity(textA);
+                            const tokensB = this.tokenizeForSimilarity(textB);
+                            const shared = Array.from(tokensA).filter(token => tokensB.has(token)).slice(0, 4);
+
+                            entries.push({
+                                timestamp: new Date().toISOString(),
+                                concept: shared.join(', ') || 'policy conflict',
+                                sourceA: docA.filename,
+                                sourceB: docB.filename,
+                                positionA: `${ruleA.condition || ''} ${ruleA.consequence || ruleA.text || ''}`.trim(),
+                                positionB: `${ruleB.condition || ''} ${ruleB.consequence || ruleB.text || ''}`.trim()
+                            });
+                        }
+                    }
+                }
+            }
+
+            await this.db.replaceContradictions(entries.slice(0, 120));
+        }
+
+        async getRelevantContradictions(query, limit = 6) {
+            const all = await this.db.getAllContradictions();
+            if (!all.length) return [];
+
+            const queryTokens = this.tokenizeForSimilarity(query);
+            const ranked = all.map(item => {
+                const conceptTokens = this.tokenizeForSimilarity(item.concept || '');
+                const overlap = this.getTokenOverlap(queryTokens, conceptTokens);
+                const sourceText = `${item.positionA || ''} ${item.positionB || ''}`;
+                const sourceOverlap = this.getTokenOverlap(queryTokens, this.tokenizeForSimilarity(sourceText));
+                return {
+                    ...item,
+                    score: (overlap * 0.65) + (sourceOverlap * 0.35)
+                };
+            }).sort((a, b) => b.score - a.score);
+
+            return ranked.filter(item => item.score > 0.06).slice(0, limit);
+        }
+
+        lexicalSimilarity(a, b) {
+            const tokensA = this.tokenizeForSimilarity(a);
+            const tokensB = this.tokenizeForSimilarity(b);
+            return this.getTokenOverlap(tokensA, tokensB);
+        }
+
+        async retrieveSimilarCases(query, limit = 3) {
+            const cases = await this.db.getAllCases();
+            if (!cases.length) return [];
+
+            let queryEmbedding = null;
+            if (this.retriever.embeddingApiKey) {
+                queryEmbedding = await this.retriever.getQueryEmbedding(`case retrieval: ${query}`);
+            }
+
+            const scored = [];
+            for (const item of cases) {
+                let score = 0;
+                if (queryEmbedding && Array.isArray(item.embedding) && item.embedding.length === queryEmbedding.length) {
+                    score = this.retriever.cosineSimilarity(queryEmbedding, item.embedding);
+                } else {
+                    score = this.lexicalSimilarity(query, item.query || '');
+                }
+                scored.push({ ...item, score });
+            }
+
+            return scored
+                .sort((a, b) => b.score - a.score)
+                .slice(0, limit);
+        }
+
+        async storeResolvedCase(query, answer, documentSet = []) {
+            let embedding = null;
+            if (this.retriever.embeddingApiKey) {
+                try {
+                    const embeddingInput = `Query: ${query}\nAnswer summary: ${String(answer || '').slice(0, 1500)}`;
+                    const vectors = await this.retriever.embedTextBatch([embeddingInput]);
+                    embedding = vectors?.[0] || null;
+                } catch (error) {
+                    console.warn('Case embedding fallback:', error);
+                }
+            }
+
+            await this.db.addCase({
+                timestamp: new Date().toISOString(),
+                query: String(query || '').slice(0, 2000),
+                answer: String(answer || '').slice(0, 12000),
+                documentSet: Array.from(new Set(documentSet)).slice(0, 100),
+                embedding
+            });
+        }
+
         setSynthesisMessage(isBroadCoverage) {
             this.synthesisIndicatorText.textContent = isBroadCoverage
-                ? 'Running deep coverage synthesis across long context...'
+                ? 'Analyzing full coverage across loaded documents...'
                 : this.defaultSynthesisText;
         }
 
@@ -4366,9 +5138,28 @@ ${attachmentEvidence.contextText}`);
             this.synthesisIndicator.classList.add('active');
 
             try {
-                let relevantChunks = hasCorpus
-                    ? await this.retriever.retrieve(query, null, { intent })
-                    : [];
+                const contextDecision = hasCorpus
+                    ? this.retriever.getContextStrategy()
+                    : { strategy: 'ATTACHMENT_ONLY', totalTokens: 0, limit: FULL_CORPUS_TOKEN_LIMIT };
+
+                const preRetrievalPrediction = hasCorpus
+                    ? await this.synthesizer.generatePreRetrievalPrediction(query)
+                    : '';
+
+                let relevantChunks = [];
+                let contradictionTargetedChunks = [];
+                if (hasCorpus) {
+                    if (contextDecision.strategy === 'FULL_CORPUS') {
+                        relevantChunks = this.retriever.allChunks.slice();
+                    } else {
+                        relevantChunks = await this.retriever.retrieve(query, null, { intent });
+                    }
+                    contradictionTargetedChunks = await this.retriever.retrieveContradictionTargeted(
+                        query,
+                        preRetrievalPrediction,
+                        12
+                    );
+                }
 
                 let attachmentContext = null;
                 if (hasAttachment) {
@@ -4391,26 +5182,104 @@ ${attachmentEvidence.contextText}`);
                     };
                 }
 
-                const relevantFilenames = new Set(relevantChunks.map(chunk => chunk.filename));
+                const inScopeFilenames = new Set();
+                if (contextDecision.strategy === 'FULL_CORPUS') {
+                    this.retriever.documents.forEach(doc => inScopeFilenames.add(doc.filename));
+                } else {
+                    relevantChunks.forEach(chunk => inScopeFilenames.add(chunk.filename));
+                    contradictionTargetedChunks.forEach(chunk => inScopeFilenames.add(chunk.filename));
+                }
+
                 const documentMemories = this.retriever.documents
-                    .filter(doc => relevantFilenames.has(doc.filename))
+                    .filter(doc => inScopeFilenames.has(doc.filename))
                     .slice(0, 10)
                     .map(doc => ({
                         filename: doc.filename,
                         memory: doc.memory
                     }));
 
+                const documentSchemas = this.retriever.documents
+                    .filter(doc => inScopeFilenames.has(doc.filename))
+                    .slice(0, 12)
+                    .map(doc => ({
+                        filename: doc.filename,
+                        ...(doc.schema || {})
+                    }));
+
+                const exceptionClauses = this.retriever.getExceptionClausesForDocuments(Array.from(inScopeFilenames));
+                const precedentCases = hasCorpus ? await this.retrieveSimilarCases(query, 3) : [];
+                const contradictionAlerts = hasCorpus ? await this.getRelevantContradictions(query, 6) : [];
+
+                const fullCorpusDocs = contextDecision.strategy === 'FULL_CORPUS'
+                    ? this.retriever.documents.map(doc => ({
+                        filename: doc.filename,
+                        fullText: doc.fullText
+                    }))
+                    : [];
+
+                const fullCorpusChunks = contextDecision.strategy === 'FULL_CORPUS'
+                    ? this.retriever.documents.flatMap(doc => doc.chunks || [])
+                    : [];
+
                 const corpusStats = {
                     numDocs: this.retriever.documents.length,
                     numChunks: this.retriever.allChunks.length,
+                    contextStrategy: contextDecision.strategy,
+                    totalCorpusTokens: contextDecision.totalTokens,
                     connectedConcepts: this.retriever.getTopConnectedConcepts(10),
                     documentMemories,
+                    documentSchemas,
+                    exceptionClauses,
+                    precedentCases,
+                    contradictionAlerts,
+                    preRetrievalPrediction,
+                    contradictionTargetedChunks,
+                    fullCorpusDocs,
+                    fullCorpusChunks,
                     corpusDigest: intent.broadCoverage
                         ? this.retriever.buildCorpusDigest(query, relevantChunks, 16)
                         : ''
                 };
 
-                const result = await this.synthesizer.synthesize(query, relevantChunks, attachmentContext, corpusStats);
+                let result = await this.synthesizer.synthesize(
+                    query,
+                    relevantChunks,
+                    attachmentContext,
+                    corpusStats,
+                    { persistResult: false }
+                );
+
+                const confidence = await this.synthesizer.assessInternalConfidence(
+                    query,
+                    result.response,
+                    result.sources
+                );
+
+                if (hasCorpus && confidence.level === 'low') {
+                    const gapQuery = this.synthesizer.buildGapRetrievalQuery(query, confidence);
+                    const gapChunks = await this.retriever.retrieve(gapQuery, null, {
+                        intent: { ...intent, broadCoverage: true }
+                    });
+                    const mergedChunks = this.retriever.mergeUniqueChunks(
+                        relevantChunks,
+                        gapChunks,
+                        Math.max((relevantChunks.length || 0) + 14, 30)
+                    );
+                    const requeryStats = {
+                        ...corpusStats,
+                        lowConfidenceRequery: true,
+                        gapQuery
+                    };
+                    result = await this.synthesizer.synthesize(
+                        query,
+                        mergedChunks,
+                        attachmentContext,
+                        requeryStats,
+                        { persistResult: false }
+                    );
+                }
+
+                this.synthesizer.persistConversationTurn(query, result.response);
                 this.addMessage(result.response, 'assistant', result.sources);
 
                 if (this.evaluator) {
@@ -4421,13 +5290,23 @@ ${attachmentEvidence.contextText}`);
                         result.meta?.instructionProfile || {},
                         result.meta?.claimDiagnostics || null
                     );
+                    if (this.adminEvalOutput) {
+                        this.adminEvalOutput.textContent = `Latest eval - Overall ${(evaluation.metrics.overall * 100).toFixed(1)}%, Coverage ${(evaluation.metrics.coverage * 100).toFixed(1)}%, Citation precision ${(evaluation.metrics.citationPrecision * 100).toFixed(1)}%`;
+                    }
+                }
 
-                    const scorePct = (evaluation.metrics.overall * 100).toFixed(1);
-                    const toastType = evaluation.metrics.overall >= 0.82 ? 'success' :
-                        evaluation.metrics.overall >= 0.65 ? 'info' : 'warning';
-                    this.showToast(
-                        `Eval score ${scorePct}% (coverage ${(evaluation.metrics.coverage * 100).toFixed(0)}%, citations ${(evaluation.metrics.citationPrecision * 100).toFixed(0)}%)`,
-                        toastType
+                if (this.adminContextStrategy) {
+                    const tokenInfo = result.meta?.corpusTokenEstimate
+                        ? ` (${result.meta.corpusTokenEstimate} estimated tokens)`
+                        : '';
+                    this.adminContextStrategy.textContent = `Context strategy: ${result.meta?.contextStrategy || contextDecision.strategy}${tokenInfo}`;
+                }
+
+                if (hasCorpus) {
+                    await this.storeResolvedCase(
+                        query,
+                        result.response,
+                        Array.from(inScopeFilenames)
                     );
                 }
             } catch (error) {
@@ -4447,22 +5326,23 @@ ${attachmentEvidence.contextText}`);
         runEvaluationHarness() {
             const summary = this.evaluator?.getRecentSummary(10);
             if (!summary) {
-                this.showToast('No evaluation data yet. Ask at least one question first.', 'warning');
+                if (this.adminEvalOutput) {
+                    this.adminEvalOutput.textContent = 'No evaluation data yet. Ask at least one question first.';
+                }
                 return;
             }
 
             const avg = summary.averages;
-            const message = [
-                `Eval Harness (last ${summary.sampleSize} turns):`,
-                `Overall: ${(avg.overall * 100).toFixed(1)}%`,
-                `Coverage: ${(avg.coverage * 100).toFixed(1)}%`,
-                `Claim citation coverage: ${(avg.citationCoverage * 100).toFixed(1)}%`,
-                `Citation precision: ${(avg.citationPrecision * 100).toFixed(1)}%`,
-                `Instruction adherence: ${(avg.instructionAdherence * 100).toFixed(1)}%`
-            ].join(' ');
-
-            this.addMessage(message, 'system');
-            this.showToast(`Eval harness completed: ${(avg.overall * 100).toFixed(1)}% overall`, 'info');
+            if (this.adminEvalOutput) {
+                this.adminEvalOutput.textContent = [
+                    `Eval harness (last ${summary.sampleSize} turns):`,
+                    `Overall ${(avg.overall * 100).toFixed(1)}%`,
+                    `Coverage ${(avg.coverage * 100).toFixed(1)}%`,
+                    `Claim citation coverage ${(avg.citationCoverage * 100).toFixed(1)}%`,
+                    `Citation precision ${(avg.citationPrecision * 100).toFixed(1)}%`,
+                    `Instruction adherence ${(avg.instructionAdherence * 100).toFixed(1)}%`
+                ].join(' | ');
+            }
         }
 
         escapeHtml(text) {
@@ -4543,9 +5423,28 @@ ${attachmentEvidence.contextText}`);
             return html || '<p></p>';
         }
 
+        resolveCitationText(citation, sources = []) {
+            if (citation.quote) return citation.quote;
+            const citedName = String(citation.filename || '').trim().toLowerCase();
+            const citedPage = String(citation.page || '').trim().toLowerCase();
+            const match = (sources || []).find(source => {
+                const sourceName = String(source.filename || '').trim().toLowerCase();
+                const sourcePage = String(source.page || '').trim().toLowerCase();
+                const nameMatches = sourceName === citedName || sourceName.includes(citedName) || citedName.includes(sourceName);
+                const pageMatches = !citedPage || citedPage === 'n/a' || sourcePage === citedPage || sourcePage.includes(citedPage) || citedPage.includes(sourcePage);
+                return nameMatches && pageMatches;
+            });
+            if (!match?.text) return 'Relevant source passage not extracted in citation payload.';
+            const sentence = String(match.text)
+                .replace(/\s+/g, ' ')
+                .trim()
+                .split(/(?<=[.!?])\s+/)[0];
+            return sentence.slice(0, 320);
+        }
+
         formatCitations(content, sources) {
             const normalizedContent = this.normalizeAssistantForDisplay(content);
-            const citationRegex = /\[Source:\s*([^,\]]+),\s*(?:page\s*)?([^,\]]+),\s*"([^"]+)"\]/gi;
+            const citationRegex = /\[Source:\s*([^,\]]+),\s*(?:page\s*)?([^,\]]+)(?:,\s*"([^"]+)")?\]/gi;
             const citationTokens = [];
             let tokenized = normalizedContent.replace(citationRegex, (match, filename, page, quote) => {
                 const token = `__CITATION_${citationTokens.length}__`;
@@ -4563,7 +5462,8 @@ ${attachmentEvidence.contextText}`);
 
             for (const citation of citationTokens) {
                 const sourceInfo = `${citation.filename}, Page ${citation.page}`;
-                const html = `<span class="citation" data-source="${this.escapeHtml(sourceInfo)}" data-text="${this.escapeHtml(citation.quote)}">
+                const resolvedText = this.resolveCitationText(citation, sources);
+                const html = `<span class="citation" data-source="${this.escapeHtml(sourceInfo)}" data-text="${this.escapeHtml(resolvedText)}">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/>
                     </svg>
@@ -4634,6 +5534,7 @@ ${attachmentEvidence.contextText}`);
 
     async function initializeApp() {
         try {
+            await ensureTokenizerLibrary();
             const db = new DocumentDatabase();
             await db.init();
 
