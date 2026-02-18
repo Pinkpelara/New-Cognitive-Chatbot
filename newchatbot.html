@@ -4589,6 +4589,7 @@ ${attachmentEvidence.contextText}`);
             this.evaluator = evaluator;
             this.currentAttachment = null;
             this.defaultSynthesisText = 'Reviewing documents and preparing a cited response...';
+            this.contradictionRebuildInFlight = false;
 
             this.initializeElements();
             this.bindEvents();
@@ -4729,29 +4730,24 @@ ${attachmentEvidence.contextText}`);
             }
         }
 
-        async loadCorpus() {
+        async loadCorpus(options = {}) {
             const documents = await this.db.getAllDocuments();
-            const hydratedDocuments = [];
+            this.retriever.updateCorpus(documents);
+            this.updateCorpusUI(documents);
 
-            for (const doc of documents) {
-                let hydrated = doc;
-                const hasSchema = Array.isArray(doc.schema?.primaryRules) || Array.isArray(doc.schema?.rules);
-                const needsModelSchema = !!this.synthesizer.apiKey && doc.schema?.generatedBy !== 'model';
-                if (!hasSchema || needsModelSchema) {
-                    const schema = await this.synthesizer.extractInstitutionalSchema(doc);
-                    hydrated = { ...doc, schema };
-                    try {
-                        await this.db.updateDocument(doc.id, hydrated);
-                    } catch (error) {
-                        console.warn('Unable to persist refreshed schema:', error);
-                    }
+            const skipContradictionRefresh = options.refreshContradictions === false;
+            if (skipContradictionRefresh || this.contradictionRebuildInFlight) return;
+
+            this.contradictionRebuildInFlight = true;
+            setTimeout(async () => {
+                try {
+                    await this.rebuildContradictionRegistry(documents);
+                } catch (error) {
+                    console.warn('Background contradiction rebuild failed:', error);
+                } finally {
+                    this.contradictionRebuildInFlight = false;
                 }
-                hydratedDocuments.push(hydrated);
-            }
-
-            this.retriever.updateCorpus(hydratedDocuments);
-            await this.rebuildContradictionRegistry(hydratedDocuments);
-            this.updateCorpusUI(hydratedDocuments);
+            }, 0);
         }
 
         updateCorpusUI(documents) {
@@ -4819,12 +4815,7 @@ ${attachmentEvidence.contextText}`);
 
                 try {
                     const document = await this.processor.processFile(file);
-                    const schema = await this.synthesizer.extractInstitutionalSchema(document);
-                    const documentWithSchema = {
-                        ...document,
-                        schema: schema || document.schema
-                    };
-                    await this.db.addDocument(documentWithSchema);
+                    await this.db.addDocument(document);
                     processed++;
                     this.showToast(`Processed: ${file.name}`, 'success');
                 } catch (error) {
@@ -4988,14 +4979,14 @@ ${attachmentEvidence.contextText}`);
 
         async rebuildContradictionRegistry(documents = []) {
             const entries = [];
-            const docs = documents || [];
+            const docs = (documents || []).slice(0, 120);
 
-            for (let i = 0; i < docs.length; i++) {
+            outer: for (let i = 0; i < docs.length; i++) {
                 for (let j = i + 1; j < docs.length; j++) {
                     const docA = docs[i];
                     const docB = docs[j];
-                    const rulesA = (docA.schema?.primaryRules || []).slice(0, 20);
-                    const rulesB = (docB.schema?.primaryRules || []).slice(0, 20);
+                    const rulesA = (docA.schema?.primaryRules || []).slice(0, 10);
+                    const rulesB = (docB.schema?.primaryRules || []).slice(0, 10);
 
                     for (const ruleA of rulesA) {
                         for (const ruleB of rulesB) {
@@ -5015,8 +5006,16 @@ ${attachmentEvidence.contextText}`);
                                 positionA: `${ruleA.condition || ''} ${ruleA.consequence || ruleA.text || ''}`.trim(),
                                 positionB: `${ruleB.condition || ''} ${ruleB.consequence || ruleB.text || ''}`.trim()
                             });
+
+                            if (entries.length >= 180) {
+                                break outer;
+                            }
                         }
                     }
+                }
+
+                if (i > 0 && i % 8 === 0) {
+                    await wait(0);
                 }
             }
 
